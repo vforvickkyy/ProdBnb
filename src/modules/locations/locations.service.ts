@@ -8,7 +8,7 @@ const FOREIGN_KEY_VIOLATION = "23503";
 const LOCATION_COLUMNS = `
   id, host_id, title, description,
   address_line1, address_line2, city, region, country, postal_code,
-  latitude, longitude, capacity, status, created_at, updated_at
+  latitude, longitude, capacity, timezone, status, created_at, updated_at
 `;
 
 const LOCATION_DETAIL_SELECT = `
@@ -45,6 +45,7 @@ export interface LocationSummary {
   latitude: number | null;
   longitude: number | null;
   capacity: number | null;
+  timezone: string;
   status: string;
   created_at: string;
   updated_at: string;
@@ -137,6 +138,28 @@ export async function getVisibleLocationOrNull(supabase: SupabaseClient, id: str
     throw error;
   }
   return (data as LocationSummary | null) ?? null;
+}
+
+/**
+ * Shared ownership/visibility gate reused by every module that manages a
+ * sub-resource of a location (media, availability, ...): invisible location
+ * -> 404 (don't reveal a private draft exists), visible but not owned and
+ * caller isn't admin -> 403.
+ */
+export async function assertLocationManageable(
+  supabase: SupabaseClient,
+  callerId: string,
+  isAdmin: boolean,
+  locationId: string
+): Promise<LocationSummary> {
+  const location = await getVisibleLocationOrNull(supabase, locationId);
+  if (!location) {
+    throw new NotFoundError("Location not found.");
+  }
+  if (location.host_id !== callerId && !isAdmin) {
+    throw new ForbiddenError("You do not have permission to manage this location.");
+  }
+  return location;
 }
 
 export async function getLocation(supabase: SupabaseClient, id: string): Promise<LocationDetail> {

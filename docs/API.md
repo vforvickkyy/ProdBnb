@@ -227,6 +227,7 @@ visible only to the owning host or an admin — otherwise `404` (existence isn't
     "latitude": 51.5285,
     "longitude": -0.0775,
     "capacity": 40,
+    "timezone": "Europe/London",
     "status": "published",
     "created_at": "2026-09-03T12:00:00Z",
     "updated_at": "2026-09-03T12:00:00Z",
@@ -251,7 +252,9 @@ Requires authentication **and** the `host` role. Creates a location as `status =
 `status` cannot be set at creation. Accepts every field from the detail response except
 `id`/`host_id`/`status`/timestamps/`categories`/`amenities`/`use_cases`/`media`/`host`, plus
 optional `category_ids`/`amenity_ids`/`use_case_ids` (arrays of UUIDs from
-`GET /v1/categories`/`/v1/amenities`/`/v1/use-cases`).
+`GET /v1/categories`/`/v1/amenities`/`/v1/use-cases`). `timezone` (Phase 5) is an IANA identifier
+(e.g. `"Asia/Kolkata"`, never an abbreviation like `IST`) — defaults to `"UTC"` if omitted, and
+is what every availability window (`GET /v1/locations/:id/availability`) is interpreted against.
 
 Request:
 
@@ -384,9 +387,95 @@ Requires authentication (owner or admin). Deletes the R2 object and the metadata
 
 Response (`200`): `{ "data": { "id": "a1b2...", "deleted": true } }`
 
+## Availability & Calendar (Phase 5)
+
+**Availability is not booking** — nothing here reserves a slot; it only answers "is this
+location available at this time?" See
+[`docs/DATABASE.md`](DATABASE.md#availability--calendar-phase-5) for the full architecture
+(weekly schedules, date overrides, blocked periods, precedence, and timezone handling).
+
+Every management endpoint below (everything except the first) requires the caller to own `:id`
+or be admin, using the same 404-vs-403 rule as the rest of the API.
+
+### `GET /v1/locations/:id/availability`
+
+Optional authentication — same visibility as `GET /v1/locations/:id` (published is public,
+otherwise owner/admin only). Computed availability windows for a date range.
+
+Query: `?from=2026-10-10&to=2026-10-15` (both required; `to` must not be before `from`; the
+range is capped at 90 days)
+
+```json
+{
+  "data": [
+    { "date": "2026-10-10", "windows": [{ "start": "2026-10-10T09:00:00+05:30", "end": "2026-10-10T18:00:00+05:30" }] },
+    { "date": "2026-10-11", "windows": [] }
+  ],
+  "meta": { "from": "2026-10-10", "to": "2026-10-15", "timezone": "Asia/Kolkata" }
+}
+```
+
+One entry per requested date, even fully-unavailable ones (`windows: []`), so a client can
+render a full calendar grid without inferring gaps. Timestamps are absolute (real UTC offset) —
+unambiguous regardless of which timezone the requesting device is in. `meta.timezone` is the
+location's own IANA timezone (see `PATCH /v1/locations/:id`, which now also accepts a
+`timezone` field — defaults to `"UTC"` if never set).
+
+- `400 VALIDATION_ERROR` for a malformed date, `to` before `from`, or a range over 90 days.
+- `404 NOT_FOUND` if the location doesn't exist or isn't visible to the caller.
+
+### Weekly rules — `.../availability/rules`
+
+`GET`/`POST /v1/locations/:id/availability/rules`, `PATCH`/`DELETE .../rules/:ruleId`.
+
+```json
+{ "day_of_week": "monday", "start_time": "09:00", "end_time": "18:00" }
+```
+
+`day_of_week` is `sunday`..`saturday`. Times are wall-clock, interpreted in the location's own
+timezone. Half-open `[start, end)` — `end_time` must be strictly after `start_time`; overnight
+windows (`22:00`–`02:00`) aren't supported and are rejected. A location can have multiple windows
+on the same day (e.g. `09:00–12:00` and `14:00–18:00`), but they can't overlap each other.
+
+- `409 CONFLICT` if the window overlaps an existing rule for that day.
+
+### Date overrides — `.../availability/overrides`
+
+`GET`/`POST /v1/locations/:id/availability/overrides`, `PATCH`/`DELETE .../overrides/:overrideId`.
+
+An override **replaces** that date's weekly schedule entirely, rather than merging with it.
+
+```json
+{ "date": "2026-10-05", "status": "unavailable" }
+{ "date": "2026-10-11", "status": "available", "start_time": "10:00", "end_time": "14:00" }
+```
+
+`status: "unavailable"` is always a full-day closure — it can't carry `start_time`/`end_time`.
+`status: "available"` must always specify both (there's no "same hours as normal" shorthand —
+ambiguous on a day with no base rule at all). `date` is immutable once created — delete and
+recreate to move an override to a different date.
+
+- `409 CONFLICT` if an override already exists for that date.
+
+### Blocked periods — `.../blocks`
+
+`GET`/`POST /v1/locations/:id/blocks`, `PATCH`/`DELETE .../blocks/:blockId`.
+
+```json
+{ "start_at": "2026-10-05T13:00:00+05:30", "end_at": "2026-10-05T15:00:00+05:30", "reason": "Owner using property" }
+```
+
+`start_at`/`end_at` are absolute timestamps (can span multiple days). `reason` is optional and
+**private** — it's only ever visible through these management endpoints (owner/admin), never
+through the public `GET .../availability` response, and this table has no public read access at
+all (not even indirectly via a raw REST call with the anon key).
+
+- `409 CONFLICT` if the period overlaps an existing block for this location.
+
 ## What's intentionally not here yet
 
-Bookings, payments, reviews, messaging, notifications, and search/discovery are later phases —
-see the main project brief. Video transcoding, image processing, and AI analysis are explicitly
-out of scope for the R2 integration itself. Phase 3 only proves the media storage foundation
-those future refinements would build on.
+Bookings, payments, reviews, messaging, notifications, and availability-aware search are later
+phases — see the main project brief. `GET /v1/locations` (search) does not filter by
+availability yet; a client currently checks a candidate location's availability separately via
+`GET /v1/locations/:id/availability`. Video transcoding, image processing, and AI analysis remain
+out of scope for the R2 integration.

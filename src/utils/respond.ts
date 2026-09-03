@@ -1,12 +1,11 @@
 import { Response } from "express";
 
-interface PaginationMeta {
-  page: number;
-  pageSize: number;
-  total: number;
-}
-
-export function ok<T>(res: Response, data: T, status = 200, meta?: PaginationMeta): void {
+export function ok<T, M extends Record<string, unknown> = Record<string, unknown>>(
+  res: Response,
+  data: T,
+  status = 200,
+  meta?: M
+): void {
   res.status(status).json(meta ? { data, meta } : { data });
 }
 

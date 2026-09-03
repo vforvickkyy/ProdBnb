@@ -3,6 +3,7 @@ import express, { Express } from "express";
 import helmet from "helmet";
 import { env } from "./config/env";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
+import { availabilityRouter } from "./modules/availability/availability.routes";
 import { catalogRouter } from "./modules/catalog/catalog.routes";
 import { locationsRouter } from "./modules/locations/locations.routes";
 import { mediaRouter } from "./modules/media/media.routes";
@@ -24,6 +25,7 @@ export function createApp(): Express {
   app.use("/v1", rolesRouter);
   app.use("/v1", locationsRouter);
   app.use("/v1", mediaRouter);
+  app.use("/v1", availabilityRouter);
   app.use("/v1", catalogRouter);
 
   app.use(notFoundHandler);

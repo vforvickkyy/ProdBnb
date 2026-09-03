@@ -411,6 +411,157 @@ no `status`) — `src/modules/search/search.service.ts` maps `primary_media_key`
 `publicUrlFor()` from `src/lib/r2.ts` that the media/location-detail code already uses, so URL
 construction logic lives in exactly one place.
 
+## Availability & Calendar (Phase 5)
+
+**Availability is not booking.** Nothing in this phase reserves a slot — it answers "is this
+location available at this time?" via a weekly schedule, date-specific overrides, and blocked
+periods. Bookings arrive in Phase 6 (see "Booking compatibility" below).
+
+### Timezone
+
+`locations.timezone text not null default 'UTC'` — every wall-clock time in a weekly rule or
+override (`09:00`, say) is meaningless without a zone to interpret it against, so this column is
+foundational to everything else in this section. It's a real IANA identifier (`Asia/Kolkata`,
+`America/Los_Angeles`), never an abbreviation like `IST`/`PST` — abbreviations aren't
+unambiguous (multiple zones share `IST`) and don't carry DST rules. Validated at the
+**application layer** (`ianaTimezoneSchema` in `locations.schema.ts`, using
+`Intl.DateTimeFormat`, which throws on anything that isn't a real identifier) rather than a
+database `CHECK` — Postgres `CHECK` constraints can't contain subqueries, so validating against
+the `pg_timezone_names` catalog view isn't possible there without a trigger, which is more moving
+parts for the same guarantee `Intl` already gives.
+
+DST correctness comes for free from Postgres's own `AT TIME ZONE` operator (used throughout the
+functions below), which consults the server's IANA tzdata — there's no manual UTC-offset
+arithmetic anywhere in this design.
+
+### Schema
+
+**`public.location_availability_rules`** — weekly recurring windows, in wall-clock time relative
+to the location's own timezone.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `location_id` | `uuid` | FK, cascade |
+| `day_of_week` | `text` | `check in ('sunday'..'saturday')` — text, matching every other enum-shaped column in this schema (`status`, `role`, `media_type`), not an integer |
+| `start_time`, `end_time` | `time` | `check (end_time > start_time)` — half-open `[start, end)`, and this also means **overnight windows (e.g. `22:00–02:00`) are rejected outright**, a deliberate simplification (see below) |
+| | | `exclude using gist (location_id with =, day_of_week with =, int4range(...) with &&)` — see "Overlap prevention" |
+
+**`public.location_availability_overrides`** — date-specific, and **replaces** the day's base
+schedule entirely rather than merging with it (an `unavailable` override on a normally-open
+Monday leaves *zero* windows, not "the normal hours minus nothing").
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `location_id` | `uuid` | FK, cascade |
+| `date` | `date` | immutable after creation — delete and recreate to move one |
+| `status` | `text` | `check in ('available','unavailable')` |
+| `start_time`, `end_time` | `time`, nullable | **required together** when `status='available'` (opening a normally-closed day must say what hours — there's no "same as normal" shorthand, which would be ambiguous on a day with no base rule at all); **both null** when `status='unavailable'` (always a full-day closure, no partial-unavailable form) |
+| | | `unique (location_id, date)` — one override per date, so there's no overlap concept to prevent here beyond that |
+
+**`public.location_blocked_periods`** — arbitrary `timestamptz` ranges (unlike rules/overrides, a
+block can span multiple calendar days), for maintenance/private-use/etc.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `location_id` | `uuid` | FK, cascade |
+| `start_at`, `end_at` | `timestamptz` | absolute instants; `check (end_at > start_at)` |
+| `reason` | `text`, nullable | **private** — see RLS below |
+| `created_by` | `uuid` | `references profiles(id)` |
+| | | `exclude using gist (location_id with =, tstzrange(start_at, end_at, '[)') with &&)` |
+
+No indexes beyond what these constraints already create — the exclusion constraints' `GiST`
+indexes and the overrides' unique-constraint `btree` index already cover every query pattern this
+phase needs (location_id lookups, date/range overlap). A deliberate non-addition, same reasoning
+Phase 4 used to justify *not* adding a primary-media index.
+
+### Overlap prevention: real `EXCLUDE` constraints, not "check then insert"
+
+Per the design brief: application-level pre-checks alone can race under concurrent requests.
+Both `location_availability_rules` and `location_blocked_periods` use Postgres `EXCLUDE USING
+gist` constraints — the same double-booking-prevention technique Phase 6's `bookings` table will
+reuse (see below). Both need the `btree_gist` extension (installed alongside `postgis`, in the
+`extensions` schema) — a `GiST` exclusion constraint that mixes a plain equality column
+(`location_id`, `day_of_week`) with a range column needs it. `time` has no native Postgres range
+type, so the rules constraint expresses each window as `int4range(seconds-since-midnight,
+seconds-since-midnight, '[)')` — still exact, still half-open, just measured in seconds instead
+of a native time range. A conflicting insert raises Postgres error code `23P01`
+(`exclusion_violation`), mapped to a `409 CONFLICT` in `rules.service.ts`/`blocks.service.ts`,
+the same error-code-mapping idiom `23505`/`23503` already use elsewhere.
+
+### Overnight (cross-midnight) windows: rejected, not supported
+
+`22:00–02:00` is rejected by the plain `end_time > start_time` check. A window that isn't fully
+contained within one calendar day breaks the per-day computation loop and the half-open-interval
+reasoning used everywhere else here cleanly — this is a documented limitation, not a silent gap,
+and can be revisited later without touching anything else in this design.
+
+### `get_location_availability()` — the computed query
+
+`language plpgsql`, unlike Phase 4's `search_locations` (`language sql`) — the day-by-day
+loop and override-or-base-schedule branching map more naturally to procedural code than one
+query. **`SECURITY DEFINER`, not `INVOKER`** (the opposite of `search_locations`) — the one
+security-relevant decision in this phase worth explaining carefully:
+
+This function must read `location_blocked_periods` to correctly subtract blocked time from the
+computed windows. But `location_blocked_periods.reason` is private, so that table's `SELECT`
+policy is owner-or-admin only (see RLS below) — a plain `SECURITY INVOKER` function called
+anonymously simply couldn't see any blocks, and would report availability that's *too generous*
+to the public (never subtracting anything it can't see). `SECURITY DEFINER` — `set search_path =
+public`, fully schema-qualified body, matching `get_host_public_profile()`'s existing pattern —
+lets it read block *times* internally regardless of the caller, while its `RETURNS TABLE` shape
+(`date, start_at, end_at`) structurally cannot include `reason`; it was never selected. Before
+returning anything at all, it re-derives the location's own visibility itself:
+
+```sql
+where l.id = _location_id
+  and (l.status = 'published' or l.host_id = auth.uid() or public.has_role(auth.uid(), 'admin'))
+```
+
+— exactly the same three-way check the `locations` RLS policies themselves use — so it's safe to
+`GRANT EXECUTE` to `anon, authenticated` directly.
+
+**Algorithm**, per requested date: if an override exists, use it exclusively (available → its
+own window; unavailable → none); otherwise use every weekly rule matching that date's
+day-of-week. Convert each resulting wall-clock window to a `tstzrange` via `(date + time) at
+time zone location.timezone`. Subtract every overlapping `location_blocked_periods` range using
+Postgres's native `tstzmultirange` subtraction (`multirange - multirange`; note both operands
+must be multiranges — `multirange - range` isn't a defined operator, so a lone `tstzrange` is
+first wrapped with `tstzmultirange(...)`). Emit whatever ranges remain.
+
+The date-range itself is capped at 90 days, both as a `zod` `.refine()` at the application layer
+and, defensively, inside the function itself (`raise exception` if exceeded) — the same
+belt-and-suspenders pattern `least(_page_size, 100)` uses in `search_locations`.
+
+### RLS
+
+- `location_availability_rules` / `location_availability_overrides`: **`SELECT`** mirrors the
+  parent location's own visibility (published, or owner, or admin) — identical shape to
+  `location_categories_select_via_location`. **`INSERT`/`UPDATE`/`DELETE`**: owner or admin,
+  identical shape to `location_categories_write_via_location_owner`. Nothing sensitive lives in
+  either table — a marketplace's general operating hours are ordinary public information.
+- `location_blocked_periods`: **`SELECT` restricted to owner-or-admin only — never mirrors
+  published visibility**, the one departure from the join-table RLS shape used everywhere else
+  in this schema, specifically because of `reason`. This matters because PostgREST is directly
+  reachable by anyone holding the public anon key, entirely bypassing the Express app — if this
+  table's `SELECT` policy mirrored location visibility the way the others do, `reason` would be
+  one raw REST call away regardless of what the Express layer chooses to expose. `anon` gets no
+  grant on this table at all.
+- Every new table gets explicit `GRANT`s for `authenticated` and `service_role` from the start —
+  the Phase 1 lesson, applied on day one this time.
+
+### Booking compatibility (Phase 6 — not built yet)
+
+A future `bookings` table gets its own `EXCLUDE USING gist (location_id WITH =,
+tstzrange(start_at, end_at, '[)') WITH &&, ...)` constraint against other *confirmed* bookings
+for the same location — the exact technique this phase already uses for rules/blocks — so
+double-booking is prevented atomically at insert time, not via a "check availability, then
+insert" race, which can't be made safe at the application layer alone under concurrent requests.
+`get_location_availability()` gains one more subtraction step (confirmed bookings, alongside
+blocks) at that point; its signature and the rules/overrides/blocks tables don't need to change.
+
 ## Granting the admin role
 
 There's no endpoint for this — deliberately. `admin` is powerful enough that granting it should

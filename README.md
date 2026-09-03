@@ -6,9 +6,13 @@ and **Web**.
 
 Phase 1 (core foundation, authentication, user profiles, roles), Phase 2 (locations/listings —
 the marketplace inventory a host lists), Phase 3 (Cloudflare R2 media — direct-to-storage
-photo/video upload), and Phase 4 (search & discovery — PostgreSQL/PostGIS-backed text search,
-geographic search, and filtering) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
-[`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
+photo/video upload), Phase 4 (search & discovery — PostgreSQL/PostGIS-backed text search,
+geographic search, and filtering), and Phase 5 (availability & calendar — weekly schedules, date
+overrides, blocked periods, and timezone-aware computed availability) are done. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md), and
+[`docs/API.md`](docs/API.md) for the full picture. Availability is not booking — see
+[`docs/DATABASE.md`](docs/DATABASE.md#availability--calendar-phase-5) for how Phase 6 will build
+on it.
 
 ## Stack
 
@@ -69,9 +73,8 @@ docs/               Architecture, database, and API documentation
 ```
 
 Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`,
-`search`).
-Future features (bookings, availability, …) are added the same way, as new module folders,
-without touching existing ones.
+`search`, `availability`). Future features (bookings, payments, …) are added the same way, as
+new module folders, without touching existing ones.
 
 ## Scripts
 

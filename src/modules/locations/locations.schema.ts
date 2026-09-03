@@ -2,6 +2,21 @@ import { z } from "zod";
 
 const uuid = z.string().uuid();
 
+// Validated with Intl rather than a fixed list — throws on anything that
+// isn't a real IANA identifier (e.g. "IST"/"PST" abbreviations, which are
+// deliberately not canonical timezone representations for this API).
+export const ianaTimezoneSchema = z.string().refine(
+  (tz) => {
+    try {
+      new Intl.DateTimeFormat(undefined, { timeZone: tz });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { message: "Must be a valid IANA timezone identifier, e.g. 'Asia/Kolkata'." }
+);
+
 export const locationStatusSchema = z.enum([
   "draft",
   "submitted",
@@ -26,6 +41,7 @@ export const createLocationSchema = z
     latitude: z.number().min(-90).max(90).nullable().optional(),
     longitude: z.number().min(-180).max(180).nullable().optional(),
     capacity: z.number().int().positive().nullable().optional(),
+    timezone: ianaTimezoneSchema.optional(),
     category_ids: z.array(uuid).max(20).default([]),
     amenity_ids: z.array(uuid).max(30).default([]),
     use_case_ids: z.array(uuid).max(10).default([]),
@@ -47,6 +63,7 @@ export const updateLocationSchema = z
     latitude: z.number().min(-90).max(90).nullable().optional(),
     longitude: z.number().min(-180).max(180).nullable().optional(),
     capacity: z.number().int().positive().nullable().optional(),
+    timezone: ianaTimezoneSchema.optional(),
     category_ids: z.array(uuid).max(20).optional(),
     amenity_ids: z.array(uuid).max(30).optional(),
     use_case_ids: z.array(uuid).max(10).optional(),

@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { SupabaseClient } from "@supabase/supabase-js";
 import { env } from "../../config/env";
-import { ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
+import { NotFoundError, ValidationError } from "../../errors/AppError";
 import { deleteObject, headObject, objectKeyFor, presignUpload } from "../../lib/r2";
-import { getVisibleLocationOrNull, PublicMediaItem, toPublicMediaItem } from "../locations/locations.service";
+import {
+  assertLocationManageable,
+  getVisibleLocationOrNull,
+  PublicMediaItem,
+  toPublicMediaItem,
+} from "../locations/locations.service";
 import { ALLOWED_CONTENT_TYPES, MediaType } from "./media.schema";
 
 const MEDIA_COLUMNS = "id, media_type, storage_key, position, metadata, created_at, updated_at";
@@ -19,20 +24,13 @@ function mediaTypeForContentType(contentType: string): MediaType | undefined {
   );
 }
 
-/** Same ownership/visibility rule Phase 2 uses for PATCH/DELETE on locations themselves. */
 async function assertCanManageLocation(
   supabase: SupabaseClient,
   callerId: string,
   isAdmin: boolean,
   locationId: string
 ): Promise<void> {
-  const location = await getVisibleLocationOrNull(supabase, locationId);
-  if (!location) {
-    throw new NotFoundError("Location not found.");
-  }
-  if (location.host_id !== callerId && !isAdmin) {
-    throw new ForbiddenError("You do not have permission to manage media for this location.");
-  }
+  await assertLocationManageable(supabase, callerId, isAdmin, locationId);
 }
 
 export interface UploadAuthorization {
