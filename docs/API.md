@@ -134,8 +134,131 @@ Response: `{ "data": [ { "...": "profile" } ], "meta": { "page": 1, "pageSize": 
 
 - `403 FORBIDDEN` if the caller doesn't hold the `admin` role.
 
+### `GET /v1/locations`
+
+No authentication. The public marketplace feed — always `status = published` only, regardless
+of whether the caller happens to be signed in (a host's own drafts never leak into this feed).
+
+Query: `?page=1&pageSize=20`
+
+Response: `{ "data": [ { "...": "location summary" } ], "meta": { "page": 1, "pageSize": 20, "total": 12 } }`
+
+A location summary (list view) has no `categories`/`amenities`/`use_cases`/`media`/`host` —
+those are detail-view-only, to keep the list endpoint cheap. See fields under the detail
+endpoint below.
+
+### `GET /v1/locations/:id`
+
+Optional authentication. A `published` location is visible to anyone; any other status is
+visible only to the owning host or an admin — otherwise `404` (existence isn't revealed).
+
+```json
+{
+  "data": {
+    "id": "6e2c...",
+    "host_id": "b1f2...",
+    "title": "East London Film Studio",
+    "description": "A versatile studio space.",
+    "address_line1": null,
+    "address_line2": null,
+    "city": "London",
+    "region": null,
+    "country": "UK",
+    "postal_code": null,
+    "latitude": 51.5285,
+    "longitude": -0.0775,
+    "capacity": 40,
+    "status": "published",
+    "created_at": "2026-09-03T12:00:00Z",
+    "updated_at": "2026-09-03T12:00:00Z",
+    "categories": [{ "id": "...", "name": "Studio" }],
+    "amenities": [{ "id": "...", "name": "Parking" }],
+    "use_cases": [{ "id": "...", "name": "Film" }],
+    "media": [],
+    "host": { "id": "b1f2...", "first_name": "Alex", "last_name": "Producer", "avatar_url": null }
+  }
+}
+```
+
+`host` is `null` until that host has at least one `published` location — see
+[`docs/DATABASE.md`](DATABASE.md#get_host_public_profile). `media` is always `[]` in this phase
+(no upload endpoint yet — Phase 3).
+
+### `POST /v1/locations`
+
+Requires authentication **and** the `host` role. Creates a location as `status = "draft"` —
+`status` cannot be set at creation. Accepts every field from the detail response except
+`id`/`host_id`/`status`/timestamps/`categories`/`amenities`/`use_cases`/`media`/`host`, plus
+optional `category_ids`/`amenity_ids`/`use_case_ids` (arrays of UUIDs from
+`GET /v1/categories`/`/v1/amenities`/`/v1/use-cases`).
+
+Request:
+
+```json
+{
+  "title": "East London Film Studio",
+  "description": "A versatile studio space.",
+  "city": "London",
+  "country": "UK",
+  "latitude": 51.5285,
+  "longitude": -0.0775,
+  "capacity": 40,
+  "category_ids": ["..."],
+  "amenity_ids": ["..."],
+  "use_case_ids": ["..."]
+}
+```
+
+Response (`201`): the full detail object, as above.
+
+- `400 VALIDATION_ERROR` for a missing/invalid field, or a `category_id`/`amenity_id`/`use_case_id`
+  that doesn't exist.
+- `403 FORBIDDEN` if the caller doesn't hold the `host` role.
+
+### `PATCH /v1/locations/:id`
+
+Requires authentication. The owning host or an admin may update any of the same fields `POST`
+accepts, plus `status` — all optional, at least one required. `host_id` can never be set through
+this endpoint.
+
+**Ownership vs. existence**: if the location isn't visible to the caller at all, `404`. If it's
+visible (e.g. published) but not owned and the caller isn't admin, `403`.
+
+**Status transitions**: a host may only request `draft → submitted` or `published → archived` —
+anything else is `403`. `→ submitted` additionally requires `title`, `description`, `city`,
+`country`, `latitude`, and `longitude` to already be set (on the row or in the same request), or
+`400`. An admin may set any of the 8 statuses freely.
+
+Response (`200`): the full detail object.
+
+### `DELETE /v1/locations/:id`
+
+Requires authentication. Owning host or admin only — same 404-vs-403 rule as `PATCH`. Hard
+delete (cascades to this location's category/amenity/use-case/media rows).
+
+Response (`200`): `{ "data": { "id": "6e2c...", "deleted": true } }`
+
+### `GET /v1/me/locations`
+
+Requires authentication. Every location the caller owns, any status (the host's own dashboard
+view — as opposed to `GET /v1/locations`, which is always published-only).
+
+Query: `?page=1&pageSize=20`
+
+### `GET /v1/admin/locations`
+
+Requires authentication **and** the `admin` role. Every location regardless of status —
+the review queue.
+
+Query: `?page=1&pageSize=20&status=submitted` (`status` optional, one of the 8 lifecycle values)
+
+### `GET /v1/categories`, `GET /v1/amenities`, `GET /v1/use-cases`
+
+No authentication. The full lookup list for each, `{ "data": [ { "id": "...", "name": "..." } ] }`.
+No write endpoint — see [`docs/DATABASE.md`](DATABASE.md#categories--amenities--use_cases).
+
 ## What's intentionally not here yet
 
-Locations, bookings, payments, reviews, messaging, notifications, and media upload (Cloudflare
-R2) are later phases — see the main project brief. This phase only proves the
-identify-authenticate-authorize foundation those phases will build on.
+Bookings, payments, reviews, messaging, notifications, real media upload (Cloudflare R2), and
+search/discovery are later phases — see the main project brief. Phase 2 only proves the listing
+data model, lifecycle, ownership, and RLS those phases will build on.

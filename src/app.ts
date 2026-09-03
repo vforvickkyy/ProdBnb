@@ -3,6 +3,8 @@ import express, { Express } from "express";
 import helmet from "helmet";
 import { env } from "./config/env";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
+import { catalogRouter } from "./modules/catalog/catalog.routes";
+import { locationsRouter } from "./modules/locations/locations.routes";
 import { rolesRouter } from "./modules/roles/roles.routes";
 import { usersRouter } from "./modules/users/users.routes";
 
@@ -19,6 +21,8 @@ export function createApp(): Express {
 
   app.use("/v1", usersRouter);
   app.use("/v1", rolesRouter);
+  app.use("/v1", locationsRouter);
+  app.use("/v1", catalogRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

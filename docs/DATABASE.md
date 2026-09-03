@@ -84,7 +84,7 @@ allowed role later (e.g. a Phase-11 admin sub-role) is an ordinary constraint mi
 (`POST /v1/me/roles`); `admin` cannot be granted through any API — see "Granting the admin role"
 below.
 
-## Row Level Security
+## Row Level Security — Phase 1 (`profiles`, `user_roles`)
 
 RLS is enabled on both tables. The backend deliberately does most of its data access through a
 **request-scoped client carrying the caller's own JWT** (`src/lib/supabase.ts`), not the
@@ -111,6 +111,135 @@ recurse into itself. `public.has_role(_user_id uuid, _role text)` is a `SECURITY
 function — it runs with the privileges of its owner, bypassing RLS *inside its own body*, so
 policies can call it safely. This is the pattern Supabase's own RLS documentation recommends for
 role checks; it's used by every policy above that needs to ask "is the caller an admin."
+
+## Phase 2 schema
+
+### `public.locations`
+
+A production location listed by a `HOST`. "Property type" is deliberately **not** a column
+here — it's expressed entirely through `categories` below (see "Why no `property_type`
+column" further down).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | `default gen_random_uuid()` |
+| `host_id` | `uuid` | `references profiles(id) on delete cascade` |
+| `title` | `text` | 1–200 chars |
+| `description` | `text` | default `''`, ≤5000 chars |
+| `address_line1`, `address_line2` | `text` | nullable |
+| `city` | `text` | not null |
+| `region` | `text` | state/region, nullable |
+| `country` | `text` | not null — plain text, no country lookup table this phase |
+| `postal_code` | `text` | nullable |
+| `latitude`, `longitude` | `double precision` | nullable — a draft may be incomplete; range-checked when present |
+| `capacity` | `integer` | nullable, `> 0` when present |
+| `status` | `text` | see lifecycle below |
+| `created_at`, `updated_at` | `timestamptz` | `updated_at` via the same `set_updated_at()` trigger Phase 1 created |
+
+Indexed on `host_id`, `status`, `city`, `created_at`, and a plain btree on `(latitude,
+longitude)` — real geospatial/PostGIS indexing is a Phase 4 (Search/Discovery) concern, not
+this one.
+
+### Listing lifecycle
+
+`draft → submitted → under_review → approved → published`, with `rejected`, `suspended`, and
+`archived` as off-ramps. **Only `published` is publicly discoverable** — `approved` means an
+admin has greenlit it, `published` means it's actually live (a separate, deliberate step).
+
+Status changes go through the same `PATCH /v1/locations/:id` as any other field. Rather than a
+full workflow engine (explicitly a later concern), the allowed transitions are just:
+
+- **Host**: `draft → submitted` (must already have `title`, `description`, `city`, `country`,
+  `latitude`, `longitude` set — enforced in `locations.service.ts`, not a `NOT NULL` constraint,
+  so drafts can stay incomplete), or `published → archived`. Any other requested status from a
+  host is `403`.
+- **Admin**: any of the 8 statuses, no restrictions — this is the review/moderation lever
+  (`submitted → under_review → approved → published`, or `→ rejected`/`→ suspended` at any
+  point) until a real admin workflow (Phase 11) exists.
+
+### Why no `property_type` column
+
+The prompt for this phase listed "location/property type" as a field to consider, but
+separately mandated a normalized, multi-select `categories` system whose own example list
+(Residential, Commercial, Outdoor, Studio, Office, Industrial, Event, Lifestyle, Other) is the
+same concept — the same duplication the prompt explicitly warned against for categories vs.
+use-cases. So a location's "type" is expressed entirely through its `categories`, which also
+lets a location genuinely be more than one type (e.g. an industrial building converted into a
+studio).
+
+### `public.categories` / `public.amenities` / `public.use_cases`
+
+Three identically-shaped lookup tables: `id uuid PK`, `name text unique not null`,
+`created_at`. Seeded in the migration itself (not `supabase/seed.sql`, which only runs on local
+`db reset` and would never reach the remote project):
+
+- **categories**: Residential, Commercial, Outdoor, Studio, Office, Industrial, Event,
+  Lifestyle, Other
+- **amenities**: Parking, Power, Wi-Fi, Kitchen, Air Conditioning, Natural Light, Green Room,
+  Restroom, Sound Control
+- **use_cases**: Film, Advertising, Photography, Music Video, Editorial, Event, Other
+
+Not exhaustive — just a starting set. **No RLS** on these three (every row is always visible to
+everyone; a permissive `using (true)` policy would be pure boilerplate) — just `GRANT SELECT` to
+`anon`/`authenticated`. No client-facing write path at all; adding a new option later is a
+one-line `insert` with the service-role key, the same way granting `admin` works.
+
+### `public.location_categories` / `location_amenities` / `location_use_cases`
+
+Join tables, one per lookup table: composite PK `(location_id, <x>_id)`, both columns `on
+delete cascade`, plus a reverse index on `<x>_id` (for "all locations with category X", which
+Phase 4 will need).
+
+### `public.location_media`
+
+Metadata only — actual files live in Cloudflare R2 starting Phase 3.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `location_id` | `uuid` | `references locations(id) on delete cascade` |
+| `media_type` | `text` | `check in ('photo','video')` |
+| `storage_key` | `text` | future R2 object key — not a URL, no R2 logic exists yet |
+| `position` | `integer` | display order, default `0` |
+| `metadata` | `jsonb` | optional (width/height/duration/alt-text later) |
+| `created_at`, `updated_at` | `timestamptz` | |
+
+No write endpoint exists yet, and no write grant to `authenticated`/`anon` either — there's no
+upload flow to produce a real `storage_key`, so there's nothing for a write endpoint to do until
+Phase 3 adds both the grant and the "register this uploaded object" endpoint together.
+
+### `get_host_public_profile()`
+
+A public listing page needs to show *something* about its host (name, avatar) without exposing
+the rest of that host's `profiles` row — which stays `authenticated`-only, own-row-or-admin,
+unchanged from Phase 1. Rather than loosening that policy, this is a narrow `SECURITY DEFINER`
+function (same pattern as `has_role()`) that returns just `id, first_name, last_name,
+avatar_url`, and only for a host who has at least one `published` location. Used only by
+`GET /v1/locations/:id`.
+
+## Row Level Security — Phase 2 (`locations` and related tables)
+
+RLS is enabled on every Phase 2 table except the three lookup tables above.
+Table-level `GRANT`s are explicit everywhere, for every role including `service_role` — Supabase's
+current default does not auto-expose a newly created table to *any* Data API role, RLS or not,
+and that includes `service_role` (bypassing RLS is not the same as holding a base `GRANT`). This
+was discovered the hard way while verifying Phase 1 against a real local stack, and every Phase 2
+table's migration statements include the grants from the start.
+
+- **`locations` SELECT** — `status = 'published'`, or the caller owns it (`host_id =
+  auth.uid()`), or the caller is admin. To `anon` and `authenticated`.
+- **`locations` INSERT** — only a caller holding the `host` role, and only for themself
+  (`host_id = auth.uid() and has_role(auth.uid(),'host')`).
+- **`locations` UPDATE/DELETE** — owner or admin. The app layer additionally excludes `host_id`
+  from the update schema entirely (same defense-in-depth idiom as Phase 1 excluding `status`
+  from the profile update schema) and enforces the status-transition rule above — RLS alone
+  doesn't know about the transition allow-list.
+- **`location_categories`/`location_amenities`/`location_use_cases` SELECT** — mirrors the
+  parent location's own visibility. **INSERT/DELETE** — requires owning the parent location (or
+  admin); no separate role check needed, since ownership already implies the row's creator was
+  a host.
+- **`location_media` SELECT** — mirrors the parent location's visibility. No INSERT/UPDATE/DELETE
+  grant to `authenticated`/`anon` at all this phase (see above).
 
 ## Granting the admin role
 

@@ -4,7 +4,8 @@ The master backend for ProdBnb — a marketplace for discovering and booking fil
 photography and production locations. One backend serves three clients: **iOS**, **Android**,
 and **Web**.
 
-This is **Phase 1**: core foundation, authentication, user profiles, and roles. See
+Phase 1 (core foundation, authentication, user profiles, roles) and Phase 2 (locations/listings
+— the marketplace inventory a host lists) are done. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md), and
 [`docs/API.md`](docs/API.md) for the full picture.
 
@@ -64,8 +65,9 @@ tests/              vitest + supertest, against a real local Supabase stack
 docs/               Architecture, database, and API documentation
 ```
 
-Each `src/modules/<name>` is self-contained. Future features (locations, bookings, …) are added
-the same way, as new module folders, without touching existing ones.
+Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`). Future
+features (bookings, availability, …) are added the same way, as new module folders, without
+touching existing ones.
 
 ## Scripts
 
