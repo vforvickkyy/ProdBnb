@@ -228,8 +228,6 @@ visible only to the owning host or an admin — otherwise `404` (existence isn't
     "longitude": -0.0775,
     "capacity": 40,
     "timezone": "Europe/London",
-    "base_price_minor_units": 15000,
-    "currency": "INR",
     "instant_booking_enabled": false,
     "status": "published",
     "created_at": "2026-09-03T12:00:00Z",
@@ -240,7 +238,13 @@ visible only to the owning host or an admin — otherwise `404` (existence isn't
     "media": [
       { "id": "...", "media_type": "photo", "url": "https://media.prodbnb.com/locations/6e2c.../a1b2.../original", "position": 0, "created_at": "...", "updated_at": "..." }
     ],
-    "host": { "id": "b1f2...", "first_name": "Alex", "last_name": "Producer", "avatar_url": null }
+    "host": { "id": "b1f2...", "first_name": "Alex", "last_name": "Producer", "avatar_url": null },
+    "booking_options": [
+      { "type": "hourly", "amount_minor_units": 10000, "currency": "INR" },
+      { "type": "half_day", "amount_minor_units": 30000, "currency": "INR" },
+      { "type": "day", "amount_minor_units": 40000, "currency": "INR" },
+      { "type": "multi_day", "amount_minor_units": 15000, "currency": "INR" }
+    ]
   }
 }
 ```
@@ -248,19 +252,24 @@ visible only to the owning host or an admin — otherwise `404` (existence isn't
 `host` is `null` until that host has at least one `published` location — see
 [`docs/DATABASE.md`](DATABASE.md#get_host_public_profile). Each `media` item exposes a computed
 `url`, never the internal `storage_key` — see the media endpoints below for how it gets there.
+`booking_options` (Phase 6A) lists only the location's *active* `location_pricing` rows — see
+[`docs/DATABASE.md`](DATABASE.md#booking-types--pricing-phase-6a) and the pricing endpoints
+below; it can be empty if the host hasn't configured any pricing yet, in which case the location
+is visible but not yet bookable.
 
 ### `POST /v1/locations`
 
 Requires authentication **and** the `host` role. Creates a location as `status = "draft"` —
 `status` cannot be set at creation. Accepts every field from the detail response except
-`id`/`host_id`/`status`/timestamps/`categories`/`amenities`/`use_cases`/`media`/`host`, plus
-optional `category_ids`/`amenity_ids`/`use_case_ids` (arrays of UUIDs from
-`GET /v1/categories`/`/v1/amenities`/`/v1/use-cases`). `timezone` (Phase 5) is an IANA identifier
-(e.g. `"Asia/Kolkata"`, never an abbreviation like `IST`) — defaults to `"UTC"` if omitted, and
-is what every availability window (`GET /v1/locations/:id/availability`) is interpreted against.
-`base_price_minor_units` (Phase 6, e.g. paise for `INR`) is an hourly rate — a location with no
-price set cannot be booked; `currency` defaults to `"INR"`; `instant_booking_enabled` (default
-`false`) skips host approval when set — see [`docs/DATABASE.md`](DATABASE.md#pricing-one-hourly-rate-applied-uniformly).
+`id`/`host_id`/`status`/timestamps/`categories`/`amenities`/`use_cases`/`media`/`host`/
+`booking_options`, plus optional `category_ids`/`amenity_ids`/`use_case_ids` (arrays of UUIDs
+from `GET /v1/categories`/`/v1/amenities`/`/v1/use-cases`). `timezone` (Phase 5) is an IANA
+identifier (e.g. `"Asia/Kolkata"`, never an abbreviation like `IST`) — defaults to `"UTC"` if
+omitted, and is what every availability window (`GET /v1/locations/:id/availability`) is
+interpreted against. `instant_booking_enabled` (default `false`) skips host approval when set.
+Pricing is **not** set at location creation (or via `PATCH`) — it's configured afterward via the
+`location_pricing` endpoints below, one `booking_type` at a time — see
+[`docs/DATABASE.md`](DATABASE.md#booking-types--pricing-phase-6a).
 
 Request:
 
@@ -478,38 +487,105 @@ all (not even indirectly via a raw REST call with the anon key).
 
 - `409 CONFLICT` if the period overlaps an existing block for this location.
 
-## Bookings (Phase 6)
+## Location pricing (Phase 6A)
+
+A location doesn't accept bookings of a given type until pricing for that `booking_type` has
+been configured — see [`docs/DATABASE.md`](DATABASE.md#booking-types--pricing-phase-6a) for the
+full model (the four types, the half-day duration setting, and how `day`/`multi_day` derive their
+reserved interval from real availability). Every write endpoint below requires the caller to own
+`:id` or be admin, the same 404-vs-403 rule as `PATCH`/`DELETE /v1/locations/:id`.
+
+### `GET /v1/locations/:id/pricing`
+
+Optional authentication — same visibility as `GET /v1/locations/:id`. A non-owning/public caller
+sees only `is_active: true` rows; the owner or an admin sees every row, active or not.
+
+```json
+{
+  "data": [
+    { "id": "...", "location_id": "...", "booking_type": "hourly", "amount_minor_units": 10000, "currency": "INR", "half_day_duration_hours": null, "is_active": true, "created_at": "...", "updated_at": "..." },
+    { "id": "...", "location_id": "...", "booking_type": "half_day", "amount_minor_units": 30000, "currency": "INR", "half_day_duration_hours": 4, "is_active": true, "created_at": "...", "updated_at": "..." }
+  ]
+}
+```
+
+### `POST /v1/locations/:id/pricing`
+
+Requires authentication. Owning host or admin only.
+
+Request: `{ "booking_type": "half_day", "amount_minor_units": 30000, "currency": "INR", "half_day_duration_hours": 4 }`
+(`currency` defaults to `"INR"`; `half_day_duration_hours` is required when `booking_type` is
+`"half_day"` and rejected for every other type.)
+
+Response (`201`): the created row.
+
+- `400 VALIDATION_ERROR` — `half_day_duration_hours` missing for `half_day`, or present for a
+  different type.
+- `409 CONFLICT` — this location already has a row for that `booking_type` (deactivate or update
+  the existing one instead — `unique (location_id, booking_type)`).
+
+### `PATCH /v1/locations/:id/pricing/:pricingId`
+
+Requires authentication. Owning host or admin only. Any of `amount_minor_units`/`currency`/
+`half_day_duration_hours`/`is_active`, at least one required. Setting `is_active: false` is how a
+rate is disabled without losing it — a booker can no longer see or book that type, but the row
+(and its history) stays.
+
+Response (`200`): the updated row.
+
+### `DELETE /v1/locations/:id/pricing/:pricingId`
+
+Requires authentication. Owning host or admin only. Hard delete — prefer `PATCH
+{"is_active": false}` unless the rate was a mistake.
+
+Response (`200`): `{ "data": { "id": "...", "deleted": true } }`
+
+## Bookings (Phase 6, extended by Phase 6A)
 
 **Availability is not booking.** `GET /v1/locations/:id/availability` (above) tells a client what
 times are open; the endpoints below actually reserve one. See
-[`docs/DATABASE.md`](DATABASE.md#booking-engine--pricing-foundation-phase-6) for the full
-architecture — the atomic double-booking guarantee, the multi-day check-in/check-out model, and
-the pricing/currency reasoning.
+[`docs/DATABASE.md`](DATABASE.md#booking-engine--pricing-foundation-phase-6-extended-by-phase-6a)
+for the full architecture — the atomic double-booking guarantee, the multi-day check-in/check-out
+model, and the four booking types' pricing/interval-derivation rules.
 
-**Timezone**: `start_at`/`end_at` are full ISO-8601 timestamps **with an explicit offset**
-(e.g. `"2026-10-05T13:00:00+05:30"`), the same convention `location_blocked_periods` already
-uses. The client resolves "1pm at this location" to a real instant using the location's own
+**Timezone**: any `start_at`/`end_at`/`start_date` field is either a full ISO-8601 timestamp
+**with an explicit offset** (e.g. `"2026-10-05T13:00:00+05:30"`, the same convention
+`location_blocked_periods` already uses) or a bare `YYYY-MM-DD` date, depending on the booking
+type below. The client resolves "1pm at this location" to a real instant using the location's own
 `timezone` field (in every location response) *before* sending it — the backend only ever
 validates an already-unambiguous instant, it never guesses one from a device's local timezone.
 
 ### `POST /v1/bookings`
 
-Requires authentication **and** the `booker` role.
+Requires authentication **and** the `booker` role. The request body's shape depends on
+`booking_type` — each type only asks for the fields that actually mean something for it (an
+`hourly` booking needs a start and end; a `day` booking just needs a date):
 
-Request: `{ "location_id": "...", "start_at": "2026-10-05T09:00:00Z", "end_at": "2026-10-05T11:00:00Z" }`
+| `booking_type` | Request body | How the interval is resolved |
+|---|---|---|
+| `"hourly"` (default if omitted) | `{ "location_id", "booking_type": "hourly", "start_at", "end_at" }` | passed straight through, unchanged from Phase 6 |
+| `"half_day"` | `{ "location_id", "booking_type": "half_day", "start_at" }` | `end_at = start_at +` the location's configured `half_day_duration_hours` |
+| `"day"` | `{ "location_id", "booking_type": "day", "date": "2026-10-05" }` | the location's actual open span that date (earliest window start → latest window end) |
+| `"multi_day"` | `{ "location_id", "booking_type": "multi_day", "start_date", "end_date" }` | check-in day's window start → check-out day's window end |
 
-Response (`201`): the booking detail object (below). Created as `status: "confirmed"`
-immediately if the location has `instant_booking_enabled: true`, otherwise `"requested"`
-(host approval required).
+Omitting `booking_type` entirely is backward compatible with Phase 6: `{ "location_id",
+"start_at", "end_at" }` is treated as `"hourly"`.
 
-- `400 VALIDATION_ERROR` — the location has no price set, or the requested interval isn't
-  available (outside operating hours, inside a blocked period, or conflicts with another active
-  booking — checked, but not the source of the actual guarantee, see `docs/DATABASE.md`).
+Response (`201`): the booking detail object (below), including `booking_type`. Created as
+`status: "confirmed"` immediately if the location has `instant_booking_enabled: true`, otherwise
+`"requested"` (host approval required).
+
+- `400 VALIDATION_ERROR` — this location has no active pricing for the requested `booking_type`,
+  the derived date has no availability at all, or the resolved interval isn't available (outside
+  operating hours, a schedule gap that day, inside a blocked period, or conflicts with another
+  active booking of *any* type — checked, but not the source of the actual guarantee, see
+  `docs/DATABASE.md`).
 - `403 FORBIDDEN` — caller doesn't hold the `booker` role.
 - `404 NOT_FOUND` — the location doesn't exist or isn't published.
-- `409 CONFLICT` — a concurrent request won the exact same interval first. This is the real
-  double-booking guarantee firing, not a bug — a well-behaved client should let the booker pick a
-  different time and retry.
+- `409 CONFLICT` — a concurrent request won the exact same (or an overlapping) interval first,
+  regardless of which booking type either side used to get there. This is the real double-booking
+  guarantee firing, not a bug — a well-behaved client should let the booker pick a different time
+  and retry.
 
 ### `GET /v1/bookings`
 
@@ -528,6 +604,7 @@ caller.
     "id": "...",
     "location": { "id": "...", "title": "East London Film Studio", "city": "London", "timezone": "Europe/London" },
     "booker_id": "...",
+    "booking_type": "hourly",
     "start_at": "2026-10-05T09:00:00+00:00",
     "end_at": "2026-10-05T11:00:00+00:00",
     "status": "confirmed",

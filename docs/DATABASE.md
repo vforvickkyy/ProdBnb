@@ -553,7 +553,7 @@ belt-and-suspenders pattern `least(_page_size, 100)` uses in `search_locations`.
 - Every new table gets explicit `GRANT`s for `authenticated` and `service_role` from the start —
   the Phase 1 lesson, applied on day one this time.
 
-## Booking Engine + Pricing Foundation (Phase 6)
+## Booking Engine + Pricing Foundation (Phase 6, extended by Phase 6A)
 
 **The critical requirement**: two users requesting the same location and overlapping interval at
 nearly the same instant must never both end up with an active booking. This is guaranteed by a
@@ -568,7 +568,8 @@ check before either one inserts.
 | `id` | `uuid` PK | |
 | `location_id` | `uuid` | `references locations(id)` — **no `on delete cascade`**, unlike every other FK to `locations` in this schema (see below) |
 | `booker_id` | `uuid` | `references profiles(id) on delete cascade` |
-| `start_at`, `end_at` | `timestamptz` | absolute instants; `check (end_at > start_at)` |
+| `booking_type` | `text` | `check in ('hourly','half_day','day','multi_day')` — **Phase 6A**, immutable after creation (no endpoint ever updates it); every pre-Phase-6A row was backfilled to `'hourly'` |
+| `start_at`, `end_at` | `timestamptz` | absolute instants; `check (end_at > start_at)` — the one interval every booking type ultimately resolves to, see "Booking types" below |
 | `status` | `text` | `check in ('requested','confirmed','cancelled','completed','rejected')`, default `'requested'` |
 | `base_amount_minor_units` | `integer` | the price snapshot — see "Pricing" below |
 | `platform_fee_minor_units`, `tax_minor_units`, `discount_minor_units` | `integer`, default `0` | unused this phase (always `0`), structurally ready for Phase 7 |
@@ -641,21 +642,106 @@ loop already used. This is what makes `GET /v1/locations/:id/availability` corre
 showing booked time with no change to its API contract, and it never leaks booker identity or
 pricing — the return shape is still just three columns.
 
-### Pricing: one hourly rate, applied uniformly
+### Booking types & pricing (Phase 6A)
 
-`locations.base_price_minor_units` (nullable integer — a location with no price set cannot be
-booked) is a flat **hourly** rate. `total = round(base_price_minor_units * duration_hours)`,
-where `duration_hours` is the raw elapsed wall-clock time between `start_at`/`end_at` — the same
-formula whether the booking is two hours or three days, no special-casing per calendar day. This
-is deliberately the smallest pricing model that already works for hourly, day-wise, and
-multi-day bookings alike; a tiered day-rate (e.g. a discount past 8 hours) is a natural, isolated
-change to this one calculation later, not a reason to add a second pricing table now.
+Phase 6 shipped one implicit pricing model: a single hourly rate on `locations`, `total =
+round(rate * elapsed_hours)`. That's wrong for a production-location marketplace, where a shoot
+is more often booked as a half-day, a full day, or several consecutive days at a flat rate than
+as raw hours. Phase 6A replaces it with four distinct booking types that all still resolve to the
+one thing the exclusion constraint above has always protected atomically: a `[start_at, end_at)`
+interval. **Nothing about the exclusion constraint, `get_location_availability()`, or
+`is_interval_available()` changed for this** — Phase 6A is entirely about what happens *before*
+those are called.
+
+#### `public.location_pricing`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `location_id` | `uuid` | `references locations(id) on delete cascade` |
+| `booking_type` | `text` | `check in ('hourly','half_day','day','multi_day')` |
+| `amount_minor_units` | `integer` | `check (>= 0)` — the per-hour rate for `hourly`, the flat rate for `half_day`/`day`, the per-day rate for `multi_day` |
+| `currency` | `text` | same `^[A-Z]{3}$` check as everywhere else, default `'INR'`, per-row (not inherited from a single location-level currency) |
+| `half_day_duration_hours` | `integer`, nullable | only meaningful — and required — when `booking_type = 'half_day'`; `check` enforces both directions (must be set for `half_day`, must be null otherwise), `between 1 and 23` |
+| `is_active` | `boolean not null default true` | toggled off rather than deleted, so a rate can be re-enabled without losing history |
+| `created_at`, `updated_at` | `timestamptz` | existing `set_updated_at()` trigger |
+| | | `unique (location_id, booking_type)` — one active-or-inactive row per type per location, so there's never a "which rate wins" ambiguity |
+
+A location doesn't need every type configured. An unconfigured or deactivated type simply can't
+be booked (`400 VALIDATION_ERROR`, not `404` — the location itself is real and visible, that one
+booking type just isn't offered there).
+
+`locations.base_price_minor_units`/`currency` (Phase 6) still exist as columns — dropping them
+would be destructive for no benefit — but the application layer stopped reading and writing them
+entirely after Phase 6A shipped; `location_pricing` is the sole pricing source. The Phase 6A
+migration backfills a `location_pricing` row (`booking_type = 'hourly'`) from any location that
+had a non-null `base_price_minor_units`, so an already-bookable listing doesn't go dark.
+
+#### The four booking types and how each resolves to an interval
+
+Each type has its own request shape (`POST /v1/bookings`, a `zod` discriminated union on
+`booking_type`) — not one generic `{start_at, end_at}` forced onto every type. Interval
+resolution happens once, in `resolveInterval()` (`bookings.service.ts`), before the unmodified
+Phase 6 `is_interval_available()` check ever runs:
+
+- **`hourly`** — `{ start_at, end_at }`, unchanged from Phase 6. Price:
+  `round(amount_minor_units * elapsed_hours)`.
+- **`half_day`** — `{ start_at }` only. `end_at = start_at + location_pricing.half_day_duration_hours`
+  (host-configured per location, e.g. `4`) — not a fixed universal duration, and not yet a named
+  `MORNING`/`AFTERNOON` window system (a clean, isolated later extension to this same column, not
+  a reason to build a second booking engine now). Price is the flat configured `amount_minor_units`,
+  no multiplication — the price *is* the price for that unit.
+- **`day`** — `{ date }` only, no times. The reserved interval is derived from the location's
+  *actual* availability that date via `get_location_availability(location_id, date, date)` — the
+  earliest window's start to the latest window's end — never a naive 24-hour assumption. If that
+  date's schedule has a gap (e.g. `09:00–12:00` and `14:00–18:00`), the derived span
+  (`09:00–18:00`) fails the existing same-day *strict single-window containment* check in
+  `is_interval_available()`, so a `day` booking is correctly rejected on a day the location isn't
+  actually open continuously. Price is the flat configured `amount_minor_units`.
+- **`multi_day`** — `{ start_date, end_date }`, no times. Check-in day contributes its earliest
+  window's start, check-out day contributes its latest window's end (each via the same
+  availability-derivation `day` uses), and the combined interval is validated by the exact same
+  multi-day "continuous custody" path `is_interval_available()` already implements for Phase 6 —
+  intermediate days impose no operating-hours requirement of their own, unchanged. Price:
+  `amount_minor_units * day_count`, where `day_count` is the inclusive number of calendar days
+  between `start_date` and `end_date` in the location's own timezone (e.g. ₹15,000/day × 3 days =
+  ₹45,000).
+
+No new availability logic exists anywhere for this — `day`/`multi_day` derivation is a thin
+reuse of `get_location_availability()`, and all four types share the identical
+`is_interval_available()` pre-check and the identical `EXCLUDE` constraint downstream, which is
+completely unaware of `booking_type`. This is also why cross-type conflicts work automatically:
+an `hourly` request overlapping an existing `half_day` booking (or any other type pair) is
+rejected the same way a same-type overlap always was — the constraint only ever sees an interval.
+
+**Backward compatibility**: a request that omits `booking_type` entirely is treated as `hourly`
+with `{location_id, start_at, end_at}` — the exact original Phase 6 shape, byte-for-byte. An
+existing client that hasn't picked up the new field yet keeps working unmodified.
+
+#### Centralized pricing calculation
+
+`calculateBookingPrice()` (`src/modules/bookings/pricing.ts`) is the single place any booking
+amount is computed — `bookings.service.ts` never contains a pricing formula itself. It looks up
+the one active `location_pricing` row for `(location_id, booking_type)` — throwing a `400` if
+none exists — then applies exactly one of the four formulas above. No taxes/fees/discounts are
+computed yet; the existing Phase 6 snapshot columns for them stay `0`, structurally ready for
+Phase 7.
 
 **Currency**: `text`, `check (currency ~ '^[A-Z]{3}$')` — an ISO-4217 *shape*, not a fixed
 allowlist of specific currencies, so supporting a new one is never a migration. Defaults to
 `'INR'`. **Minor units** (e.g. paise), never floating point — avoids all floating-point rounding
 error by construction, and matches how real payment processors (Stripe, Razorpay) represent
 amounts, which will matter once Phase 7 has to hand this number to one.
+
+#### RLS on `location_pricing`
+
+The same two-policy shape already used for `location_categories`/`location_availability_rules`:
+**`SELECT`** mirrors the parent location's visibility (published, or owner, or admin — pricing
+for a live listing is ordinary public marketplace information, the same reasoning already applied
+to operating hours in Phase 5) — a non-owning/public caller only ever sees `is_active = true`
+rows, while the owner/admin see everything so they can manage inactive rows too. **`INSERT`/
+`UPDATE`/`DELETE`** ("for all") requires owning the parent location or being admin, via the same
+`assertLocationManageable()` helper every other location sub-resource module already shares.
 
 ### Price snapshot
 

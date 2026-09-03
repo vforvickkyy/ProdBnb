@@ -8,13 +8,15 @@ Phase 1 (core foundation, authentication, user profiles, roles), Phase 2 (locati
 the marketplace inventory a host lists), Phase 3 (Cloudflare R2 media — direct-to-storage
 photo/video upload), Phase 4 (search & discovery — PostgreSQL/PostGIS-backed text search,
 geographic search, and filtering), Phase 5 (availability & calendar — weekly schedules, date
-overrides, blocked periods, and timezone-aware computed availability), and Phase 6 (booking
-engine + pricing foundation — atomic double-booking prevention, price snapshots, booking
-lifecycle) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+overrides, blocked periods, and timezone-aware computed availability), Phase 6 (booking engine +
+pricing foundation — atomic double-booking prevention, price snapshots, booking lifecycle), and
+Phase 6A (booking model & pricing expansion — four booking types, `hourly`/`half_day`/`day`/
+`multi_day`, each resolving to the same atomically-protected interval, normalized per-type
+`location_pricing`) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
 Booking payment is Phase 7 — see
-[`docs/DATABASE.md`](docs/DATABASE.md#booking-engine--pricing-foundation-phase-6) for the exact
-extension point.
+[`docs/DATABASE.md`](docs/DATABASE.md#booking-engine--pricing-foundation-phase-6-extended-by-phase-6a)
+for the exact extension point.
 
 ## Stack
 
@@ -75,8 +77,8 @@ docs/               Architecture, database, and API documentation
 ```
 
 Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`,
-`search`, `availability`, `bookings`). Future features (payments, notifications, …) are added the
-same way, as new module folders, without touching existing ones.
+`search`, `availability`, `bookings`, `pricing`). Future features (payments, notifications, …)
+are added the same way, as new module folders, without touching existing ones.
 
 ## Scripts
 

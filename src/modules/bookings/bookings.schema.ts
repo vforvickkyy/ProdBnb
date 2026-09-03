@@ -1,22 +1,85 @@
 import { z } from "zod";
+import { bookingTypeSchema } from "../pricing/pricing.schema";
 
 const uuid = z.string().uuid();
 const offsetDateTime = z.string().datetime({ offset: true });
+const dateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Must be an ISO date, e.g. 2026-10-05.");
 
 export const bookingStatusSchema = z.enum(["requested", "confirmed", "cancelled", "completed", "rejected"]);
 
-export const createBookingSchema = z
+// Each booking type has its own request shape — an hourly booking needs
+// start+end, a day booking needs only a date, etc. (§16: "do not force every
+// booking type to use meaningless identical request fields"). `booking_type`
+// is the zod discriminant; every branch is `.strict()` so a request can't
+// mix fields from the wrong type.
+
+const hourlyBookingSchema = z
   .object({
     location_id: uuid,
+    booking_type: z.literal("hourly"),
     start_at: offsetDateTime,
     end_at: offsetDateTime,
   })
-  .strict()
-  .refine((d) => new Date(d.end_at) > new Date(d.start_at), {
+  .strict();
+
+const halfDayBookingSchema = z
+  .object({
+    location_id: uuid,
+    booking_type: z.literal("half_day"),
+    // end_at is derived from the location's configured half_day_duration_hours,
+    // not client-supplied — see resolveInterval() in bookings.service.ts.
+    start_at: offsetDateTime,
+  })
+  .strict();
+
+const dayBookingSchema = z
+  .object({
+    location_id: uuid,
+    booking_type: z.literal("day"),
+    // No times at all — the reserved interval is derived from the location's
+    // actual availability that date (never a naive 24-hour assumption).
+    date: dateOnly,
+  })
+  .strict();
+
+const multiDayBookingSchema = z
+  .object({
+    location_id: uuid,
+    booking_type: z.literal("multi_day"),
+    start_date: dateOnly,
+    end_date: dateOnly,
+  })
+  .strict();
+
+// discriminatedUnion requires each member to be a plain ZodObject (so it can
+// inspect the discriminant key directly) — a .refine() wraps a schema in
+// ZodEffects, which breaks that. Cross-field checks that only apply to one
+// branch are applied to the union as a whole instead, narrowing on
+// booking_type inside the refinement.
+const bookingUnionSchema = z
+  .discriminatedUnion("booking_type", [hourlyBookingSchema, halfDayBookingSchema, dayBookingSchema, multiDayBookingSchema])
+  .refine((d) => d.booking_type !== "hourly" || new Date(d.end_at) > new Date(d.start_at), {
     message: "end_at must be after start_at.",
     path: ["end_at"],
+  })
+  .refine((d) => d.booking_type !== "multi_day" || d.end_date >= d.start_date, {
+    message: "end_date must not be before start_date.",
+    path: ["end_date"],
   });
-export type CreateBookingInput = z.infer<typeof createBookingSchema>;
+
+// Backward compatibility (§23): a request with no booking_type at all is the
+// exact original Phase 6 shape ({location_id, start_at, end_at}) and is
+// treated as `hourly` — an existing client that hasn't picked up the new
+// field yet keeps working unmodified. A request that DOES specify a type
+// still gets full, precise, per-type validation via the union above.
+export const createBookingSchema = z.preprocess((value) => {
+  if (value && typeof value === "object" && !("booking_type" in value)) {
+    return { ...value, booking_type: "hourly" };
+  }
+  return value;
+}, bookingUnionSchema);
+
+export type CreateBookingInput = z.infer<typeof bookingUnionSchema>;
 
 // reject/cancel bodies are entirely optional (just an optional reason) — a
 // client that sends no body at all is legitimate here, but Express's
@@ -41,3 +104,5 @@ export const listBookingsQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });
 export type ListBookingsQuery = z.infer<typeof listBookingsQuerySchema>;
+
+export { bookingTypeSchema };

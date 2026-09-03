@@ -1,12 +1,14 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
 import { getVisibleLocationOrNull } from "../locations/locations.service";
+import { BookingType } from "../pricing/pricing.schema";
 import { BookingActionInput, CreateBookingInput, ListBookingsQuery } from "./bookings.schema";
+import { calculateBookingPrice, getActivePricing } from "./pricing";
 
 const EXCLUSION_VIOLATION = "23P01";
 
 const BOOKING_COLUMNS = `
-  id, location_id, booker_id, start_at, end_at, status,
+  id, location_id, booker_id, booking_type, start_at, end_at, status,
   base_amount_minor_units, platform_fee_minor_units, tax_minor_units, discount_minor_units,
   total_amount_minor_units, currency,
   cancelled_at, cancelled_by, cancellation_reason,
@@ -29,6 +31,7 @@ interface RawBookingRow {
   id: string;
   location_id: string;
   booker_id: string;
+  booking_type: string;
   start_at: string;
   end_at: string;
   status: string;
@@ -50,6 +53,7 @@ export interface BookingDetail {
   id: string;
   location: LocationRef;
   booker_id: string;
+  booking_type: string;
   start_at: string;
   end_at: string;
   status: string;
@@ -73,6 +77,7 @@ function toBookingDetail(row: RawBookingRow): BookingDetail {
     id: row.id,
     location: row.locations,
     booker_id: row.booker_id,
+    booking_type: row.booking_type,
     start_at: row.start_at,
     end_at: row.end_at,
     status: row.status,
@@ -92,6 +97,79 @@ function toBookingDetail(row: RawBookingRow): BookingDetail {
   };
 }
 
+interface ResolvedWindow {
+  start_at: string;
+  end_at: string;
+}
+
+/**
+ * The earliest window-start / latest window-end for one calendar date, per
+ * `get_location_availability()` — reused as-is, never reimplemented. Used
+ * for both `day` (one date) and `multi_day` (check-in/check-out dates).
+ * Throws if the location has no availability at all that date, rather than
+ * assuming a naive full-day span.
+ */
+async function daySpan(supabase: SupabaseClient, locationId: string, date: string): Promise<ResolvedWindow> {
+  const { data, error } = await supabase.rpc("get_location_availability", {
+    _location_id: locationId,
+    _from_date: date,
+    _to_date: date,
+  });
+  if (error) {
+    throw error;
+  }
+  const windows = (data ?? []) as ResolvedWindow[];
+  if (windows.length === 0) {
+    throw new ValidationError(`This location has no availability on ${date}.`);
+  }
+
+  let start_at = windows[0]!.start_at;
+  let end_at = windows[0]!.end_at;
+  for (const w of windows) {
+    if (new Date(w.start_at) < new Date(start_at)) start_at = w.start_at;
+    if (new Date(w.end_at) > new Date(end_at)) end_at = w.end_at;
+  }
+  return { start_at, end_at };
+}
+
+/**
+ * Resolves any of the four booking-type request shapes down to the one
+ * thing the database has always protected atomically: a [start_at, end_at)
+ * interval. `is_interval_available()`/the EXCLUDE constraint downstream are
+ * completely unaware of booking_type — they only ever see the interval this
+ * function produces.
+ */
+async function resolveInterval(
+  supabase: SupabaseClient,
+  locationId: string,
+  input: CreateBookingInput
+): Promise<ResolvedWindow> {
+  switch (input.booking_type) {
+    case "hourly":
+      return { start_at: input.start_at, end_at: input.end_at };
+
+    case "half_day": {
+      const pricing = await getActivePricing(supabase, locationId, "half_day");
+      if (pricing.half_day_duration_hours === null) {
+        throw new ValidationError("This location's half-day pricing has no duration configured.");
+      }
+      const endAt = new Date(new Date(input.start_at).getTime() + pricing.half_day_duration_hours * 3_600_000);
+      return { start_at: input.start_at, end_at: endAt.toISOString() };
+    }
+
+    case "day":
+      return daySpan(supabase, locationId, input.date);
+
+    case "multi_day": {
+      const [checkIn, checkOut] = await Promise.all([
+        daySpan(supabase, locationId, input.start_date),
+        daySpan(supabase, locationId, input.end_date),
+      ]);
+      return { start_at: checkIn.start_at, end_at: checkOut.end_at };
+    }
+  }
+}
+
 export async function createBooking(
   supabase: SupabaseClient,
   bookerId: string,
@@ -104,14 +182,13 @@ export async function createBooking(
   if (!location || location.status !== "published") {
     throw new NotFoundError("Location not found.");
   }
-  if (location.base_price_minor_units === null) {
-    throw new ValidationError("This location has no price set yet and cannot be booked.");
-  }
+
+  const interval = await resolveInterval(supabase, input.location_id, input);
 
   const { data: available, error: availabilityError } = await supabase.rpc("is_interval_available", {
     _location_id: input.location_id,
-    _start_at: input.start_at,
-    _end_at: input.end_at,
+    _start_at: interval.start_at,
+    _end_at: interval.end_at,
   });
   if (availabilityError) {
     throw availabilityError;
@@ -120,8 +197,14 @@ export async function createBooking(
     throw new ValidationError("The requested time is not available.");
   }
 
-  const durationHours = (new Date(input.end_at).getTime() - new Date(input.start_at).getTime()) / 3_600_000;
-  const baseAmount = Math.round(location.base_price_minor_units * durationHours);
+  const pricing = await calculateBookingPrice(
+    supabase,
+    input.location_id,
+    input.booking_type as BookingType,
+    interval.start_at,
+    interval.end_at,
+    location.timezone
+  );
   const status = location.instant_booking_enabled ? "confirmed" : "requested";
 
   const { data, error } = await supabase
@@ -129,12 +212,13 @@ export async function createBooking(
     .insert({
       location_id: input.location_id,
       booker_id: bookerId,
-      start_at: input.start_at,
-      end_at: input.end_at,
+      booking_type: input.booking_type,
+      start_at: interval.start_at,
+      end_at: interval.end_at,
       status,
-      base_amount_minor_units: baseAmount,
-      total_amount_minor_units: baseAmount,
-      currency: location.currency,
+      base_amount_minor_units: pricing.base_amount_minor_units,
+      total_amount_minor_units: pricing.total_amount_minor_units,
+      currency: pricing.currency,
     })
     .select(BOOKING_DETAIL_SELECT)
     .single();
@@ -143,7 +227,8 @@ export async function createBooking(
     // The authoritative guarantee: even though is_interval_available already
     // checked above, a concurrent request can still win the race between
     // that check and this insert — the exclusion constraint is what
-    // actually prevents two overlapping active bookings from both existing.
+    // actually prevents two overlapping active bookings from both existing,
+    // regardless of which booking_type either side used to get there.
     if (error?.code === EXCLUSION_VIOLATION) {
       throw new ConflictError("This time was just booked by someone else. Please choose another time.");
     }

@@ -345,8 +345,11 @@ describe("availability", () => {
         .post(`/v1/locations/${locationId}/availability/rules`)
         .set(authHeader(host))
         .send({ day_of_week: "monday", start_time: "10:00", end_time: "18:00" });
-      const { error } = await adminClient.from("locations").update({ base_price_minor_units: 5000 }).eq("id", locationId);
-      if (error) throw error;
+      const pricing = await request(app)
+        .post(`/v1/locations/${locationId}/pricing`)
+        .set(authHeader(host))
+        .send({ booking_type: "hourly", amount_minor_units: 5000 });
+      expect(pricing.status).toBe(201);
       await publish(locationId);
     });
 

@@ -8,6 +8,7 @@ import { bookingsRouter } from "./modules/bookings/bookings.routes";
 import { catalogRouter } from "./modules/catalog/catalog.routes";
 import { locationsRouter } from "./modules/locations/locations.routes";
 import { mediaRouter } from "./modules/media/media.routes";
+import { pricingRouter } from "./modules/pricing/pricing.routes";
 import { rolesRouter } from "./modules/roles/roles.routes";
 import { usersRouter } from "./modules/users/users.routes";
 
@@ -28,6 +29,7 @@ export function createApp(): Express {
   app.use("/v1", mediaRouter);
   app.use("/v1", availabilityRouter);
   app.use("/v1", bookingsRouter);
+  app.use("/v1", pricingRouter);
   app.use("/v1", catalogRouter);
 
   app.use(notFoundHandler);

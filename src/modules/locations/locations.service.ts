@@ -5,11 +5,14 @@ import { CreateLocationInput, UpdateLocationInput } from "./locations.schema";
 
 const FOREIGN_KEY_VIOLATION = "23503";
 
+// base_price_minor_units/currency (Phase 6) are deliberately not selected
+// here anymore — location_pricing (Phase 6A) is the sole pricing source now.
+// The columns still exist in the database (never dropped) but the app layer
+// stops reading/writing them, so there's no way for the two to disagree.
 const LOCATION_COLUMNS = `
   id, host_id, title, description,
   address_line1, address_line2, city, region, country, postal_code,
-  latitude, longitude, capacity, timezone,
-  base_price_minor_units, currency, instant_booking_enabled,
+  latitude, longitude, capacity, timezone, instant_booking_enabled,
   status, created_at, updated_at
 `;
 
@@ -18,7 +21,8 @@ const LOCATION_DETAIL_SELECT = `
   location_categories ( categories ( id, name ) ),
   location_amenities ( amenities ( id, name ) ),
   location_use_cases ( use_cases ( id, name ) ),
-  location_media ( id, media_type, storage_key, position, metadata, created_at, updated_at )
+  location_media ( id, media_type, storage_key, position, metadata, created_at, updated_at ),
+  location_pricing ( booking_type, amount_minor_units, currency, is_active )
 `;
 
 // A host may only request these transitions through the general-purpose
@@ -48,8 +52,6 @@ export interface LocationSummary {
   longitude: number | null;
   capacity: number | null;
   timezone: string;
-  base_price_minor_units: number | null;
-  currency: string;
   instant_booking_enabled: boolean;
   status: string;
   created_at: string;
@@ -101,12 +103,26 @@ export function toPublicMediaItem(row: RawLocationMediaRow): PublicMediaItem {
   };
 }
 
+export interface BookingOption {
+  type: string;
+  amount_minor_units: number;
+  currency: string;
+}
+
+interface RawLocationPricingRow {
+  booking_type: string;
+  amount_minor_units: number;
+  currency: string;
+  is_active: boolean;
+}
+
 export interface LocationDetail extends LocationSummary {
   categories: CatalogRef[];
   amenities: CatalogRef[];
   use_cases: CatalogRef[];
   media: PublicMediaItem[];
   host: HostPublicSummary | null;
+  booking_options: BookingOption[];
 }
 
 interface RawLocationDetailRow extends LocationSummary {
@@ -114,10 +130,11 @@ interface RawLocationDetailRow extends LocationSummary {
   location_amenities: { amenities: CatalogRef }[];
   location_use_cases: { use_cases: CatalogRef }[];
   location_media: RawLocationMediaRow[];
+  location_pricing: RawLocationPricingRow[];
 }
 
 function flattenDetail(row: RawLocationDetailRow, host: HostPublicSummary | null): LocationDetail {
-  const { location_categories, location_amenities, location_use_cases, location_media, ...summary } =
+  const { location_categories, location_amenities, location_use_cases, location_media, location_pricing, ...summary } =
     row as RawLocationDetailRow;
   return {
     ...(summary as LocationSummary),
@@ -126,6 +143,13 @@ function flattenDetail(row: RawLocationDetailRow, host: HostPublicSummary | null
     use_cases: location_use_cases.map((r) => r.use_cases),
     media: location_media.map(toPublicMediaItem).sort((a, b) => a.position - b.position),
     host,
+    // Active pricing only — booking_options is a marketplace/booking-facing
+    // field, not a management one, so it's filtered the same way regardless
+    // of who's viewing (the owner/admin management view of inactive pricing
+    // configs lives at GET /v1/locations/:id/pricing, not here).
+    booking_options: location_pricing
+      .filter((p) => p.is_active)
+      .map((p) => ({ type: p.booking_type, amount_minor_units: p.amount_minor_units, currency: p.currency })),
   };
 }
 
