@@ -12,11 +12,16 @@ overrides, blocked periods, and timezone-aware computed availability), Phase 6 (
 pricing foundation — atomic double-booking prevention, price snapshots, booking lifecycle), and
 Phase 6A (booking model & pricing expansion — four booking types, `hourly`/`half_day`/`day`/
 `multi_day`, each resolving to the same atomically-protected interval, normalized per-type
-`location_pricing`), and Phase 7 (payment architecture — a provider-agnostic `PaymentProvider`
-interface with Cashfree, TEST/sandbox only, as the first implementation) are done. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md), and
-[`docs/API.md`](docs/API.md) for the full picture. Host payouts/commission splitting are the
-next payment-related extension point — see
+`location_pricing`), Phase 7 (payment architecture — a provider-agnostic `PaymentProvider`
+interface with Cashfree, TEST/sandbox only, as the first implementation), and Phase 8
+(notification infrastructure — in-app notifications, multi-device push registration, preferences,
+and a provider-agnostic `NotificationProvider` interface with APNs as the first implementation)
+are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md),
+and [`docs/API.md`](docs/API.md) for the full picture. **The notification system is fully
+developed and tested without any Apple Developer account or APNs credentials** — it defaults to
+an explicit `disabled` provider that records every push attempt honestly rather than pretending
+success (see [`docs/DATABASE.md`](docs/DATABASE.md#developing-and-testing-without-an-apple-developer-account)).
+Host payouts/commission splitting are the next payment-related extension point — see
 [`docs/DATABASE.md`](docs/DATABASE.md#payment-architecture--cashfree-integration-phase-7).
 
 ## Stack
@@ -41,6 +46,9 @@ next payment-related extension point — see
   smoke test; the test suite mocks the Cashfree adapter's network calls entirely (webhook
   signature verification is still tested for real — it's pure local HMAC, no network involved).
   Production Cashfree credentials are never used in this phase.
+- An **Apple Developer Program** membership + APNs Authentication Key — **not needed at all** to
+  build, run, or test this backend. `NOTIFICATION_PROVIDER` defaults to `disabled`; only needed
+  later for a real push notification to actually land on a physical iOS device.
 
 ## Quick start
 
@@ -82,10 +90,14 @@ docs/               Architecture, database, and API documentation
 ```
 
 Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`,
-`search`, `availability`, `bookings`, `pricing`, `payments`). Future features (notifications, …)
-are added the same way, as new module folders, without touching existing ones. `payments/providers/`
-holds the provider-agnostic `PaymentProvider` interface plus one adapter per payment provider
-(`CashfreeProvider` today) — see [`docs/DATABASE.md`](docs/DATABASE.md#payment-architecture--cashfree-integration-phase-7).
+`search`, `availability`, `bookings`, `pricing`, `payments`, `devices`, `notifications`). Future
+features are added the same way, as new module folders, without touching existing ones.
+`payments/providers/` holds the provider-agnostic `PaymentProvider` interface plus one adapter per
+payment provider (`CashfreeProvider` today) — see
+[`docs/DATABASE.md`](docs/DATABASE.md#payment-architecture--cashfree-integration-phase-7).
+`notifications/providers/` holds the identically-shaped `NotificationProvider` interface plus one
+adapter per push provider (`APNsProvider` and the default `DisabledProvider` today) — see
+[`docs/DATABASE.md`](docs/DATABASE.md#notification-infrastructure--apns-push-phase-8).
 
 ## Scripts
 

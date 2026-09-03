@@ -6,8 +6,10 @@ import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
 import { availabilityRouter } from "./modules/availability/availability.routes";
 import { bookingsRouter } from "./modules/bookings/bookings.routes";
 import { catalogRouter } from "./modules/catalog/catalog.routes";
+import { devicesRouter } from "./modules/devices/device.routes";
 import { locationsRouter } from "./modules/locations/locations.routes";
 import { mediaRouter } from "./modules/media/media.routes";
+import { notificationsRouter } from "./modules/notifications/notification.routes";
 import { postCashfreeWebhook } from "./modules/payments/payment.controller";
 import { paymentsRouter } from "./modules/payments/payment.routes";
 import { pricingRouter } from "./modules/pricing/pricing.routes";
@@ -42,6 +44,8 @@ export function createApp(): Express {
   app.use("/v1", bookingsRouter);
   app.use("/v1", pricingRouter);
   app.use("/v1", paymentsRouter);
+  app.use("/v1", devicesRouter);
+  app.use("/v1", notificationsRouter);
   app.use("/v1", catalogRouter);
 
   app.use(notFoundHandler);

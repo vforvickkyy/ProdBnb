@@ -4,6 +4,7 @@ import { env } from "../../config/env";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
 import { adminClient } from "../../lib/supabase";
 import { getBooking } from "../bookings/bookings.service";
+import { notifyPaymentFailed, notifyPaymentSuccess, notifyRefundProcessed } from "../notifications/notification.service";
 import { CreatePaymentInput, CreateRefundInput } from "./payment.schema";
 import { getPaymentProvider } from "./providers";
 import { NormalizedPaymentStatus, NormalizedWebhookEvent } from "./providers/PaymentProvider";
@@ -59,6 +60,14 @@ function nextPaymentStatus(current: string, incoming: NormalizedPaymentStatus): 
   return incoming;
 }
 
+async function getBookerId(bookingId: string): Promise<string | null> {
+  const { data, error } = await adminClient.from("bookings").select("booker_id").eq("id", bookingId).maybeSingle();
+  if (error) {
+    throw error;
+  }
+  return data?.booker_id ?? null;
+}
+
 async function applyPaymentStatusUpdate(
   paymentId: string,
   currentStatus: string,
@@ -80,7 +89,24 @@ async function applyPaymentStatusUpdate(
   if (error || !data) {
     throw error ?? new Error("Failed to update payment.");
   }
-  return data as PaymentDetail;
+  const payment = data as PaymentDetail;
+
+  // Only notify on the transition INTO a terminal outcome, not on every
+  // idempotent re-check of an already-settled payment (the guarded
+  // nextPaymentStatus() above already prevents `resolved` from moving once
+  // terminal, so this only fires the first time success/failed is reached).
+  if (resolved !== currentStatus && (resolved === "success" || resolved === "failed")) {
+    const bookerId = await getBookerId(payment.booking_id);
+    if (bookerId) {
+      if (resolved === "success") {
+        await notifyPaymentSuccess(bookerId, payment.booking_id, payment.id);
+      } else {
+        await notifyPaymentFailed(bookerId, payment.booking_id, payment.id);
+      }
+    }
+  }
+
+  return payment;
 }
 
 /**
@@ -230,7 +256,7 @@ export async function verifyPayment(supabase: SupabaseClient, paymentId: string)
 async function recomputePaymentRefundStatus(paymentId: string): Promise<void> {
   const { data: payment, error } = await adminClient
     .from("payments")
-    .select("id, amount_minor_units, status")
+    .select("id, booking_id, amount_minor_units, status")
     .eq("id", paymentId)
     .single();
   if (error || !payment) {
@@ -258,6 +284,18 @@ async function recomputePaymentRefundStatus(paymentId: string): Promise<void> {
     const { error: updateError } = await adminClient.from("payments").update({ status: newStatus }).eq("id", paymentId);
     if (updateError) {
       throw updateError;
+    }
+
+    // One notification per payment the first time it moves away from a
+    // clean 'success' into any refunded state -- iOS has a single
+    // refund_processed type regardless of full vs. partial, and a later
+    // second partial refund completing the remainder doesn't get a second
+    // notification (a deliberate Phase 8 scope cut, see docs/DATABASE.md).
+    if (payment.status === "success") {
+      const bookerId = await getBookerId(payment.booking_id);
+      if (bookerId) {
+        await notifyRefundProcessed(bookerId, payment.booking_id, payment.id);
+      }
     }
   }
 }

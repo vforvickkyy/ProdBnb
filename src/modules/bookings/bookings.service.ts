@@ -1,6 +1,12 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
 import { getVisibleLocationOrNull } from "../locations/locations.service";
+import {
+  notifyBookingCancelled,
+  notifyBookingConfirmed,
+  notifyBookingDeclined,
+  notifyBookingRequestReceived,
+} from "../notifications/notification.service";
 import { BookingType } from "../pricing/pricing.schema";
 import { BookingActionInput, CreateBookingInput, ListBookingsQuery } from "./bookings.schema";
 import { calculateBookingPrice, getActivePricing } from "./pricing";
@@ -235,7 +241,18 @@ export async function createBooking(
     throw error ?? new Error("Failed to create booking.");
   }
 
-  return toBookingDetail(data as unknown as RawBookingRow);
+  const booking = toBookingDetail(data as unknown as RawBookingRow);
+
+  // Downstream effect only -- never allowed to fail booking creation itself
+  // (notify*() guarantees it never throws, see notification.service.ts).
+  await notifyBookingRequestReceived(location.host_id, booking.id);
+  if (booking.status === "confirmed") {
+    // instant_booking_enabled skipped host approval -- the booker should
+    // still be told their booking is confirmed.
+    await notifyBookingConfirmed(bookerId, booking.id);
+  }
+
+  return booking;
 }
 
 export interface PaginatedBookings {
@@ -341,7 +358,9 @@ export async function confirmBooking(
   if (row.status !== "requested") {
     throw new ValidationError(`Cannot confirm a booking with status '${row.status}'.`);
   }
-  return transitionBooking(supabase, bookingId, { status: "confirmed" });
+  const booking = await transitionBooking(supabase, bookingId, { status: "confirmed" });
+  await notifyBookingConfirmed(booking.booker_id, booking.id);
+  return booking;
 }
 
 export async function rejectBooking(
@@ -358,10 +377,12 @@ export async function rejectBooking(
   if (row.status !== "requested") {
     throw new ValidationError(`Cannot reject a booking with status '${row.status}'.`);
   }
-  return transitionBooking(supabase, bookingId, {
+  const booking = await transitionBooking(supabase, bookingId, {
     status: "rejected",
     cancellation_reason: input.reason ?? null,
   });
+  await notifyBookingDeclined(booking.booker_id, booking.id);
+  return booking;
 }
 
 export async function completeBooking(
@@ -394,10 +415,23 @@ export async function cancelBooking(
   if (row.status !== "requested" && row.status !== "confirmed") {
     throw new ValidationError(`Cannot cancel a booking with status '${row.status}'.`);
   }
-  return transitionBooking(supabase, bookingId, {
+  const booking = await transitionBooking(supabase, bookingId, {
     status: "cancelled",
     cancelled_at: new Date().toISOString(),
     cancelled_by: callerId,
     cancellation_reason: input.reason ?? null,
   });
+
+  // Notify whichever party did NOT do the cancelling -- the booker cancelling
+  // notifies the host, the host (or an admin) cancelling notifies the booker.
+  if (isBooker) {
+    const location = await getVisibleLocationOrNull(supabase, row.location_id);
+    if (location) {
+      await notifyBookingCancelled(location.host_id, booking.id);
+    }
+  } else {
+    await notifyBookingCancelled(booking.booker_id, booking.id);
+  }
+
+  return booking;
 }

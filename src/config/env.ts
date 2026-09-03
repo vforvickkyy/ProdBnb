@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { z } from "zod";
 
-const envSchema = z.object({
+const baseEnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   CORS_ORIGINS: z
@@ -44,7 +44,35 @@ const envSchema = z.object({
   CASHFREE_APP_ID: z.string().min(1),
   CASHFREE_SECRET_KEY: z.string().min(1),
   CASHFREE_API_VERSION: z.string().min(1).default("2023-08-01"),
+
+  // Which NotificationProvider implementation is active (see
+  // src/modules/notifications/providers/index.ts). Defaults to "disabled" —
+  // unlike PAYMENT_PROVIDER, this phase must remain fully testable with zero
+  // Apple credentials, so "no provider configured" is the default, not an
+  // error state. APNS_* below are validated as a group only when
+  // NOTIFICATION_PROVIDER=apns is actually selected (see the .refine() below).
+  NOTIFICATION_PROVIDER: z.enum(["disabled", "apns"]).default("disabled"),
+
+  // Sandbox-only this phase, same enum-of-one pattern as CASHFREE_ENV.
+  APNS_ENVIRONMENT: z.enum(["sandbox"]).default("sandbox"),
+  APNS_TEAM_ID: z.string().min(1).optional(),
+  APNS_KEY_ID: z.string().min(1).optional(),
+  APNS_BUNDLE_ID: z.string().min(1).optional(),
+  // The .p8 key's PEM contents. Server-only: never returned through an API,
+  // never logged, never sent to any client.
+  APNS_PRIVATE_KEY: z.string().min(1).optional(),
 });
+
+const envSchema = baseEnvSchema.refine(
+  (value) =>
+    value.NOTIFICATION_PROVIDER !== "apns" ||
+    (value.APNS_TEAM_ID && value.APNS_KEY_ID && value.APNS_BUNDLE_ID && value.APNS_PRIVATE_KEY),
+  {
+    message:
+      "NOTIFICATION_PROVIDER=apns requires APNS_TEAM_ID, APNS_KEY_ID, APNS_BUNDLE_ID, and APNS_PRIVATE_KEY to all be set.",
+    path: ["NOTIFICATION_PROVIDER"],
+  }
+);
 
 const parsed = envSchema.safeParse(process.env);
 

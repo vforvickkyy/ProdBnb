@@ -957,6 +957,188 @@ later phase can add a `host_payouts` table keyed off both without touching anyth
 here — this is a structural extension point, not a schema pre-commitment, consistent with not
 building for a requirement that hasn't been asked for yet.
 
+## Notification Infrastructure + APNs Push (Phase 8)
+
+**The explicit goal**: a provider-agnostic notification layer — in-app notification records,
+per-device push delivery, user preferences — as a *downstream* effect of booking/payment events
+that already exist (Phases 6/6A/7). Nothing about booking or payment state machines changed to
+build this; `notification.service.ts` is the only new dependency `bookings.service.ts`/
+`payment.service.ts` picked up, and the dependency runs one direction only.
+
+```
+bookings.service.ts / payment.service.ts   (unmodified state machines)
+        |  small, best-effort, non-blocking notify*() calls after a commit
+        v
+notification.service.ts
+        |
+        +--> notifications (in-app record, idempotent via source_event_id)
+        |
+        +--> for each of the recipient's active devices ->
+                 NotificationProvider interface (src/modules/notifications/providers/)
+                       |                              \
+                  APNsProvider                    DisabledProvider (default)
+```
+
+A `notify*()` call is a plain async function call, not an event bus/queue — this repo has no
+queue infrastructure, and none was warranted for this. Every exported `notify*()` function
+(`notification.service.ts`) catches its own errors internally and never throws, so a notification
+bug or transient failure can never fail the booking/payment operation that triggered it.
+
+**A big constraint this phase conforms to rather than invents**: the ProdBnb iOS app already ships
+a fully-built, unconnected notification client (`Models/NotificationPayload.swift`,
+`Services/Notifications/*`, a `NotificationTypeKey` enum) with an exact documented push payload
+contract. This phase matches that contract exactly rather than inventing a new one, so the iOS
+team can wire up real push with zero client-side changes later.
+
+### Which event produces which notification, and why some don't exist yet
+
+| Backend moment | Recipient | `type` |
+|---|---|---|
+| `createBooking()`, always | the location's host | `booking_request_received` |
+| `createBooking()`, additionally if the resulting status is `confirmed` (instant booking) | the booker | `booking_confirmed` |
+| `confirmBooking()` | the booker | `booking_confirmed` |
+| `rejectBooking()` | the booker | `booking_declined` |
+| `cancelBooking()` | whichever party did **not** cancel | `booking_cancelled` |
+| a payment reaching `success` | the booker | `payment_success` |
+| a payment reaching `failed` | the booker | `payment_failed` |
+| a payment first moving away from `success` into any refunded state | the booker | `refund_processed` |
+
+Two deliberate string translations happen here, not accidents: a booking's own `status` value
+`rejected` becomes notification type **`booking_declined`**, and a payment reaching `refunded`/
+`partially_refunded` becomes **`refund_processed`** — these are the exact raw values the iOS
+app's `NotificationTypeKey` enum already expects; the booking/payment tables' own status vocabulary
+is untouched. `completeBooking()` and a refund reaching `created`/`failed` deliberately produce
+**no** notification — iOS's enum has no corresponding case for either, and inventing one
+unilaterally on the backend would create a type the client can't parse.
+
+### `public.user_devices`
+
+One row per (user, physical device/app-install). `device_token` is **globally unique**, not
+scoped per user — a push token identifies a device+app-install, not a person. Registering a token
+that already belongs to a *different* user (logout, someone else logs in on the same phone)
+reassigns that row via a plain `upsert(..., { onConflict: "device_token" })` rather than erroring,
+so a shared device correctly stops notifying the previous owner. Never hard-deleted —
+`DELETE /v1/devices/:id` sets `is_active = false`, preserving `notification_delivery_attempts`
+history. `platform` already models `ios`/`android`/`web` even though only `ios` has a real
+adapter this phase (see below).
+
+### `public.notifications`
+
+One row per logical notification per **recipient**, never per device (see delivery below).
+`type` is `CHECK`-constrained to exactly the seven values in the table above — deliberately not a
+free-text column, matching every other enum-shaped column in this schema. `entity_type` is
+similarly constrained to `('booking')` only: every event this phase produces traces back to
+exactly one booking (confirmed by the iOS app's own `NotificationRouter`, which deep-links all
+seven types via a booking id specifically, even the payment/refund ones). `data jsonb` is a small
+forward-compatible bag for anything beyond `entity_id` a push payload wants to carry (e.g.
+`payment_id`), mirroring the iOS payload's own `raw: [String:String]` bag. `source_event_id` is
+the idempotency key (see below); a partial `unique (user_id, source_event_id) where
+source_event_id is not null` is the actual guarantee.
+
+**Why delivery status lives in its own table, not a column here**: a notification is one row per
+user-event; delivery is inherently *per device*, and a user can have several. Putting delivery
+status on `notifications` would either force one row per device (breaking the idempotency/
+read-state model) or collapse multiple devices' distinct outcomes into one field (losing real
+information — "worked on the iPhone, invalid token on the old iPad").
+
+### `public.notification_preferences`
+
+One row per `(user_id, category)` — the same "one row per (owner, type)" idiom `location_pricing`
+(Phase 6A) already established. Only `booking` and `payment` exist as categories — the only two
+with a real notification-producing event this phase. **A missing row means enabled** — the safe
+default, so a user who never opens settings still gets transactional push delivery.
+
+**Preferences gate push delivery only, never notification creation.** The in-app `notifications`
+list is always complete regardless of this table; a disabled category only means no push attempt
+is made for that category's events. This resolves a real tension: a critical transactional
+notification must never accidentally vanish just because a preference toggle is off, but the iOS
+app already ships user-facing Booking/Payment notification toggles that need to mean *something*.
+The something they mean is "don't buzz my phone for this," not "don't tell me at all."
+
+### `public.notification_delivery_attempts`
+
+One row per (notification, device) push attempt, append-only like `payment_webhook_events` — a
+retry (not implemented this phase, see below) would be a new row, never a mutation of an old one.
+`status` includes an explicit **`skipped`** outcome, distinct from both `sent` and `failed` — used
+whenever `NOTIFICATION_PROVIDER=disabled` (the default with no Apple credentials configured).
+This is a deliberate, load-bearing design choice: **a push is never silently reported as
+delivered when nothing was actually attempted.** `invalid_token` immediately flips the owning
+`user_devices` row to `is_active = false`.
+
+### Idempotency
+
+`source_event_id` format: `"<entity_type>:<entity_id>:<type>"`, e.g.
+`"booking:<uuid>:booking_confirmed"`, `"payment:<uuid>:payment_success"` — fully deterministic
+from the triggering entity + event type, no separate counter needed. Calling the same `notify*()`
+twice for the same logical event (a bug, or two code paths racing) collides on insert (`23505`)
+and the second call is a safe no-op — no second notification row, and critically, **no second
+round of delivery attempts either**, since delivery only ever runs after a *successful* insert.
+
+### `NotificationProvider` and APNs
+
+Mirrors `PaymentProvider` (Phase 7) deliberately — the identical "one internal concept, swappable
+external provider" shape, already proven out. `APNsProvider` uses Apple's token-based (JWT)
+HTTP/2 API (`node:http2` + `node:crypto`'s ES256 signing via `dsaEncoding: "ieee-p1363"`, zero new
+npm dependencies — the same zero-extra-HTTP-dependency pattern R2/Cashfree already established),
+caching the signed provider JWT for ~50 minutes rather than re-signing per request (Apple's own
+recommendation). Apple's actual HTTP response is normalized before it ever reaches
+`notification.service.ts`: `BadDeviceToken`/`Unregistered`/`DeviceTokenNotForTopic` → `invalid_token`
+(device deactivated), any other non-`200` → `failed`, `200` → `sent` with the `apns-id` response
+header captured as `provider_message_id`. Sandbox only this phase — `APNS_ENVIRONMENT`'s schema
+(`src/config/env.ts`) only accepts `"sandbox"`, the same enum-of-one pattern `CASHFREE_ENV` uses,
+so a future production switch is a conscious two-line change (schema + host map), never an
+accidental config typo.
+
+**Push payload** (`{"aps": {"alert": {"title","body"}, "sound":"default"}, "prodbnb_type": ...,
+"prodbnb_entity_type": "booking", "prodbnb_entity_id": ..., "prodbnb_booking_id": ...}`) matches
+`NotificationPayload.swift`'s already-documented top-level custom-key convention exactly. No
+private booking/payment detail (amounts, location names) is put in the title/body — copy is
+deliberately generic; the client looks up full detail via `entity_id`/`prodbnb_booking_id` once
+opened.
+
+### Developing and testing without an Apple Developer account
+
+`NOTIFICATION_PROVIDER` defaults to `"disabled"` — unlike `PAYMENT_PROVIDER`, which requires real
+Cashfree credentials unconditionally, this phase must remain fully testable with zero Apple
+configuration. With the default `DisabledProvider`, every push attempt is honestly recorded as
+`skipped`; the full notification pipeline — creation, idempotency, multi-device fan-out,
+preferences, the booking/payment integration — is exercised end-to-end against real Postgres with
+no network call involved at all. `APNsProvider`'s own JWT/payload construction and HTTP
+response-mapping logic is separately unit-tested with `http2` mocked at the boundary (the same
+"mock the network, keep the database real" approach `tests/payments.test.ts` already established
+for Cashfree). Real push delivery to a physical device is the one thing this cannot cover — that
+requires the Apple configuration below.
+
+### Manual Apple configuration (only for real push delivery — not required to build or test this)
+
+1. An Apple Developer Program membership (paid) — obtains the Team ID and lets you generate
+   credentials; not required for anything in this repository to build or pass its tests.
+2. Register the iOS app's App ID/bundle identifier with the **Push Notifications** capability.
+3. Generate an **APNs Authentication Key** (`.p8`) in the Apple Developer portal — produces the
+   Key ID.
+4. Add the Push Notifications entitlement to the iOS app in Xcode (client-side, outside this repo).
+5. Real APNs tokens are only issued on a **physical device** — the iOS Simulator cannot register
+   for remote push at all.
+6. Sandbox (development-signed builds) and production (TestFlight/App Store builds) get different
+   tokens, valid only against the matching Apple host — `APNS_ENVIRONMENT`/`user_devices.environment`
+   exist specifically to keep these from being conflated.
+
+### RLS
+
+| Table | `SELECT` | `INSERT`/`UPDATE`/`DELETE` |
+|---|---|---|
+| `notifications` | `user_id = auth.uid()` only — no host/admin override; nothing in this phase establishes a legitimate product need for admin visibility into another user's notifications | `UPDATE` only (the client only ever sets `read_at`), same scope. **No `INSERT` grant** — a client must never fabricate a notification for itself or anyone else, the same reasoning Phase 7 applied to `payments`. |
+| `user_devices` | `user_id = auth.uid()` | `UPDATE` only (the soft-delete toggle on a row the caller already owns). **No `INSERT` grant** — registration always goes through `device.service.ts`'s `service_role` client, since a token collision with a *different* user's existing row (reassignment) is something RLS structurally cannot allow a normal user-scoped client to do. This is the second module (after `payments`) whose request path genuinely depends on `adminClient`. |
+| `notification_preferences` | `user_id = auth.uid()` | ordinary self-service (mirrors `location_pricing`'s owner-write shape) — no cross-user concern here at all |
+| `notification_delivery_attempts` | none for `authenticated`/`anon` | `service_role` only — internal audit table, mirrors `payment_webhook_events` exactly |
+
+### Error/retry strategy
+
+No retry queue this phase — each notification triggers exactly one delivery attempt per active
+device, synchronously, at creation time. A `failed`/`invalid_token` result is recorded and left
+there; a future phase could re-scan failed attempts, but that's an isolated, additive extension,
+not built now, and this repo has no existing queue to plug one into anyway.
+
 ## Granting the admin role
 
 There's no endpoint for this — deliberately. `admin` is powerful enough that granting it should

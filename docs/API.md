@@ -733,13 +733,101 @@ an invalid or missing signature is rejected before any database write. See
 [`docs/DATABASE.md`](DATABASE.md#raw-body--signature-verification) for the raw-body handling
 detail and the idempotency/out-of-order-safety guarantees.
 
+## Devices (Phase 8 — push registration)
+
+Provider-agnostic by design — see
+[`docs/DATABASE.md`](DATABASE.md#notification-infrastructure--apns-push-phase-8). A user may have
+several devices (phone, tablet, a future Android/Web client); registering a token already
+belonging to a different user reassigns it (handles logout/re-login on a shared device).
+
+### `POST /v1/devices`
+
+Requires authentication. Request: `{ "device_token": "...", "platform": "ios", "environment": "sandbox" }`
+(`platform` one of `ios`/`android`/`web`; `environment` one of `sandbox`/`production`, optional —
+meaningful for `ios`). Upserts by `device_token`, always attributed to the caller — there is no
+`user_id` field in the request body, it can never be someone else's device.
+
+Response (`201`): the device record. **The raw `device_token` is never echoed back or returned by
+any endpoint** — the caller already has it.
+
+### `GET /v1/devices`
+
+Requires authentication. RLS-scoped list of the caller's own devices, including inactive
+(soft-deleted) ones.
+
+### `DELETE /v1/devices/:id`
+
+Requires authentication, owner only (`404` otherwise). Soft delete (`is_active: false`) —
+preserves delivery-attempt history for that device.
+
+Response (`200`): `{ "data": { "id": "...", "deleted": true } }`
+
+## Notifications (Phase 8)
+
+In-app notification records and per-device push delivery, generated only as a downstream effect
+of real booking/payment events — see
+[`docs/DATABASE.md`](DATABASE.md#which-event-produces-which-notification-and-why-some-dont-exist-yet)
+for exactly which backend event produces which notification `type`, and to whom.
+
+### `GET /v1/notifications`
+
+Requires authentication. RLS-scoped, paginated (`page`/`pageSize`), optional `?unread=true`.
+
+```json
+{
+  "data": [
+    {
+      "id": "...", "type": "booking_confirmed", "title": "Booking confirmed",
+      "body": "Your booking has been confirmed.",
+      "entity_type": "booking", "entity_id": "...",
+      "data": {}, "read_at": null, "created_at": "...", "updated_at": "..."
+    }
+  ],
+  "meta": { "page": 1, "pageSize": 20, "total": 3 }
+}
+```
+
+### `GET /v1/notifications/:id`
+
+Requires authentication. RLS-scoped, `404` if not visible to the caller.
+
+### `POST /v1/notifications/:id/read`
+
+Requires authentication, owner only. Sets `read_at`; idempotent if already read.
+
+### `POST /v1/notifications/read-all`
+
+Requires authentication. Marks every one of the caller's unread notifications read.
+
+Response (`200`): `{ "data": { "marked_read": 3 } }`
+
+### `GET /v1/notification-preferences`
+
+Requires authentication. Always returns both categories, defaulting any missing row to `true`:
+
+```json
+{ "data": { "booking": true, "payment": true } }
+```
+
+### `PATCH /v1/notification-preferences`
+
+Requires authentication. Request: `{ "booking": true, "payment": false }` (either field optional,
+at least one required). **Disabling a category only suppresses push delivery for it — the in-app
+notification list is never affected**, per `docs/DATABASE.md`'s explanation of why critical
+transactional notifications can't accidentally disappear.
+
 ## What's intentionally not here yet
 
-Reviews, messaging, notifications, favorites, an admin UI, and availability-aware search are
-later phases — see the main project brief. `GET /v1/locations` (search) still does not filter by
-availability; a client checks a candidate location's availability separately via
-`GET /v1/locations/:id/availability` and books via `POST /v1/bookings`. Host payouts / commission
-splitting are a documented extension point (`docs/DATABASE.md`) but not implemented — Cashfree
-funds currently settle into ProdBnb's own merchant account, refunds are admin-only, and Razorpay
-support is a future provider adapter, not built this phase. Video transcoding, image processing,
-and AI analysis remain out of scope for the R2 integration.
+Reviews, messaging, favorites, an admin UI, and availability-aware search are later phases — see
+the main project brief. `GET /v1/locations` (search) still does not filter by availability; a
+client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
+and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension
+point (`docs/DATABASE.md`) but not implemented — Cashfree funds currently settle into ProdBnb's
+own merchant account, refunds are admin-only, and Razorpay support is a future provider adapter,
+not built this phase. Real APNs push delivery requires Apple Developer configuration this project
+doesn't have yet (`docs/DATABASE.md`'s Phase 8 section) — the notification system is fully built
+and tested against an explicit `disabled` provider in the meantime. Booking reminders, messaging,
+and support notifications are not implemented — no scheduler or messaging/support feature exists
+in this backend yet for them to be a downstream effect of. Android (FCM) and Web Push are future
+`NotificationProvider` adapters, not built this phase. Video transcoding, image processing, and AI
+analysis remain out of scope for the R2 integration.
