@@ -1,5 +1,4 @@
 import { Request, Response } from "express";
-import { anonClient } from "../../lib/supabase";
 import { callerHasRole } from "../../middleware/requireRole";
 import { created, ok } from "../../utils/respond";
 import {
@@ -15,15 +14,8 @@ import {
   getLocation,
   listAllLocationsForAdmin,
   listMyLocations,
-  listPublicLocations,
   updateLocation,
 } from "./locations.service";
-
-export async function getPublicLocations(req: Request, res: Response): Promise<void> {
-  const { page, pageSize } = req.valid!.query as ListLocationsQuery;
-  const { data, total } = await listPublicLocations(anonClient, page, pageSize);
-  ok(res, data, 200, { page, pageSize, total });
-}
 
 export async function getLocationDetail(req: Request, res: Response): Promise<void> {
   const { id } = req.valid!.params as LocationIdParam;

@@ -5,8 +5,9 @@ photography and production locations. One backend serves three clients: **iOS**,
 and **Web**.
 
 Phase 1 (core foundation, authentication, user profiles, roles), Phase 2 (locations/listings —
-the marketplace inventory a host lists), and Phase 3 (Cloudflare R2 media — direct-to-storage
-photo/video upload) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+the marketplace inventory a host lists), Phase 3 (Cloudflare R2 media — direct-to-storage
+photo/video upload), and Phase 4 (search & discovery — PostgreSQL/PostGIS-backed text search,
+geographic search, and filtering) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
 
 ## Stack
@@ -67,7 +68,8 @@ tests/              vitest + supertest, against a real local Supabase stack (R2 
 docs/               Architecture, database, and API documentation
 ```
 
-Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`).
+Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`,
+`search`).
 Future features (bookings, availability, …) are added the same way, as new module folders,
 without touching existing ones.
 

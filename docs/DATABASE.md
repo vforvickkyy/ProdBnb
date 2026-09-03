@@ -315,6 +315,102 @@ before calling `/complete`. This exercises every bit of real business logic (own
 validation, the 404-vs-403 distinction, ordering) without needing a real bucket to run `npm
 test`. Real end-to-end verification (an actual `PUT` to actual R2) needs real values in `.env`.
 
+## Search & Discovery (Phase 4)
+
+`GET /v1/locations` is backed entirely by PostgreSQL/PostGIS — no external search engine
+(Elasticsearch/Algolia/etc.), no microservice. Everything lives in one function,
+`public.search_locations(...)`, called via the anon client exactly like the rest of the public
+API (`src/lib/supabase.ts` → `anonClient`).
+
+### Why a SQL function instead of PostgREST filters
+
+PostgREST's URL-filter syntax can express simple `column = value` filters, but not "match ALL of
+these amenity ids," "order by a computed distance," or full-text ranking, all in one query. A
+single `SECURITY INVOKER`, `STABLE` SQL function (same pattern as `has_role()`/
+`get_host_public_profile()`) takes every filter as a typed, named parameter — never string
+interpolation — builds one parameterized query internally, and returns compact rows plus a
+`count(*) over()` window column for the total, in one round trip.
+
+**Security note**: the function's `WHERE` clause hardcodes `status = 'published'` explicitly. It
+doesn't rely on RLS alone to keep this safe, even though RLS would also filter it — a query that
+originates from backend code should make its own intent explicit rather than assuming a
+downstream policy will always be there to catch a mistake.
+
+### Two generated columns, not separately-maintained duplicate data
+
+```sql
+search_vector tsvector generated always as (
+  setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+  setweight(to_tsvector('english', coalesce(city, '')), 'B') ||
+  setweight(to_tsvector('english', coalesce(description, '')), 'C')
+) stored
+
+location_point geography(Point, 4326) generated always as (
+  case when latitude is not null and longitude is not null
+    then ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
+  end
+) stored
+```
+
+Both are `GENERATED ALWAYS ... STORED` — derived entirely from `title`/`description`/`city` and
+`latitude`/`longitude`, recomputed automatically on every insert/update, so they can never drift
+out of sync with the columns clients actually read and write. `latitude`/`longitude` stay the
+simple, JSON-friendly representation every client already consumes; `location_point` exists
+purely as an internal, indexable representation for `ST_DWithin`/`ST_Distance` — this is the
+"clear reason" the general "don't duplicate lat/lng" rule (Phase 2) allows for.
+
+`to_tsvector('english', text)` (the `regconfig`-qualified form) is `IMMUTABLE` and so valid in a
+generated column; the plain `to_tsvector(text)` form depends on a runtime setting and is not.
+Query-side text search uses `websearch_to_tsquery('english', ...)` — the variant designed for
+raw user-typed queries (handles quoted phrases, `-exclude`, etc. sensibly) rather than requiring
+tsquery's own operator syntax.
+
+### PostGIS
+
+`create extension if not exists postgis with schema extensions;` — installed into the dedicated
+`extensions` schema, not `public`, matching the Supabase-recommended convention already reflected
+in `supabase/config.toml`'s `extra_search_path = ["public", "extensions"]`. Verified directly
+against the local stack (both migration application *and* an actual RPC call — PostGIS function/
+type resolution inside a function body is the one place schema-qualification could subtly break)
+before this was applied anywhere else.
+
+### Filter semantics
+
+- **Categories, use-cases**: match **any** of the given ids — `exists (select 1 from
+  location_categories where location_id = l.id and category_id = any(_category_ids))`.
+- **Amenities**: match **all** of the given ids — a location must hold every one, not just one:
+  `(select count(distinct amenity_id) from location_amenities where location_id = l.id and
+  amenity_id = any(_amenity_ids)) = cardinality(_amenity_ids)`. This is the standard "match every
+  tag" SQL pattern, and matches both the prompt's own spec and the existing (mocked) iOS
+  `SearchRepository`'s filter behavior.
+- **Radius**: `ST_DWithin(location_point, ST_MakePoint(lng,lat)::geography, radius_km * 1000)` —
+  independent of sorting; a client can supply `lat`/`lng` alone just to get `distance_km`
+  annotated and sortable, without a hard radius cutoff.
+- **Bounding box**: a plain `latitude between south and north and longitude between west and
+  east` — all four corners required together; doesn't handle the antimeridian-crossing case
+  (`west > east` is rejected, not interpreted as wrapping).
+
+### Indexes
+
+| Index | Backs |
+|---|---|
+| `locations_search_vector_idx` (GIN on `search_vector`) | `search=` |
+| `locations_location_point_idx` (GiST on `location_point`) | `radius_km=`, bounding box, `sort=nearest` |
+| `locations_status_created_at_idx` (btree on `status, created_at desc`) | every query (always filters `published`) combined with the default newest-first sort |
+
+No new index for `city`/`region`/`country` exact-match filtering, and none for "primary media" —
+the existing `(location_id, position)` index on `location_media` (Phase 2) already makes "first
+media item for this location" a cheap index-scan lookup, exactly what `search_locations`'s
+correlated subquery needs. Both are documented here as deliberate non-additions, not oversights —
+candidates to revisit if `EXPLAIN ANALYZE` on real data ever shows a need, not built blindly now.
+
+### Response shape
+
+`search_locations` returns compact rows (`excerpt` instead of full `description`, no `host_id`,
+no `status`) — `src/modules/search/search.service.ts` maps `primary_media_key` through the same
+`publicUrlFor()` from `src/lib/r2.ts` that the media/location-detail code already uses, so URL
+construction logic lives in exactly one place.
+
 ## Granting the admin role
 
 There's no endpoint for this — deliberately. `admin` is powerful enough that granting it should

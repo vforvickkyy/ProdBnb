@@ -183,10 +183,6 @@ async function listLocations(
   return { data: (data as LocationSummary[]) ?? [], total: count ?? 0 };
 }
 
-export function listPublicLocations(anon: SupabaseClient, page: number, pageSize: number): Promise<PaginatedLocations> {
-  return listLocations(anon, page, pageSize, { status: "published" });
-}
-
 export function listMyLocations(
   supabase: SupabaseClient,
   hostId: string,

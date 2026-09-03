@@ -134,18 +134,77 @@ Response: `{ "data": [ { "...": "profile" } ], "meta": { "page": 1, "pageSize": 
 
 - `403 FORBIDDEN` if the caller doesn't hold the `admin` role.
 
-### `GET /v1/locations`
+### `GET /v1/locations` — search & discovery
 
-No authentication. The public marketplace feed — always `status = published` only, regardless
-of whether the caller happens to be signed in (a host's own drafts never leak into this feed).
+No authentication. The public marketplace discovery feed — always `status = published` only,
+regardless of whether the caller happens to be signed in (a host's own drafts never leak into
+this feed). Text search, geographic search, and filters (Phase 4) all live on this one endpoint
+— see [`docs/DATABASE.md`](DATABASE.md#search--discovery-phase-4) for how it's implemented
+(PostgreSQL full-text + PostGIS, one `search_locations()` function, no external search engine).
 
-Query: `?page=1&pageSize=20`
+**Query parameters** (all optional, all combinable):
 
-Response: `{ "data": [ { "...": "location summary" } ], "meta": { "page": 1, "pageSize": 20, "total": 12 } }`
+| Param | Notes |
+|---|---|
+| `search` | Full-text search over title/city/description (title weighted highest). Tolerant of normal typed queries, e.g. `search=modern loft london`. |
+| `city`, `region`, `country` | Case-insensitive exact match. |
+| `category_ids`, `use_case_ids` | Comma-separated UUIDs (from `GET /v1/categories`/`/v1/use-cases`) — matches **any** of the given ids. |
+| `amenity_ids` | Comma-separated UUIDs (from `GET /v1/amenities`) — matches **all** of the given ids (a location must have every one). |
+| `capacity_min`, `capacity_max` | Positive integers; `capacity_min` must be ≤ `capacity_max`. |
+| `lat`, `lng` | Must be provided together. Annotates each result with `distance_km` and enables `sort=nearest`. |
+| `radius_km` | Optional add-on to `lat`/`lng` (≤500) — restricts results to within that radius; without it, `lat`/`lng` alone just annotates/sorts by distance with no cutoff. |
+| `north`, `south`, `east`, `west` | Map-viewport bounding box — all four required together or none. `north` must be `>` `south`, `east` must be `>` `west` (bounding boxes crossing the antimeridian aren't supported). |
+| `sort` | `newest` \| `relevant` (default) \| `nearest`. `relevant` behaves like `newest` when no `search` term is given (no other relevance signal exists yet). `nearest` requires `lat`+`lng`. |
+| `page`, `pageSize` | Same convention as every other list endpoint — `pageSize` capped at 100 (`400` if exceeded, not silently capped). |
 
-A location summary (list view) has no `categories`/`amenities`/`use_cases`/`media`/`host` —
-those are detail-view-only, to keep the list endpoint cheap. See fields under the detail
-endpoint below.
+**Response** — a compact card per result, intentionally smaller than the detail endpoint's
+object (no `host_id`, `status`, address lines, or full media list):
+
+```json
+{
+  "data": [
+    {
+      "id": "6e2c...",
+      "title": "East London Film Studio",
+      "excerpt": "A versatile studio with natural light for shoots.",
+      "city": "London",
+      "region": "Greater London",
+      "country": "UK",
+      "latitude": 51.5285,
+      "longitude": -0.0775,
+      "capacity": 40,
+      "categories": [{ "id": "...", "name": "Studio" }],
+      "use_cases": [{ "id": "...", "name": "Film" }],
+      "primary_media_url": "https://media.prodbnb.com/locations/6e2c.../a1b2.../original",
+      "created_at": "2026-09-03T12:00:00Z",
+      "distance_km": 1.4
+    }
+  ],
+  "meta": { "page": 1, "pageSize": 20, "total": 12 }
+}
+```
+
+`excerpt` is `description` truncated to 240 characters. `primary_media_url` is `null` if the
+location has no media yet. `distance_km` is only present when `lat`/`lng` were supplied.
+
+**Examples**
+
+```
+GET /v1/locations?search=villa
+GET /v1/locations?city=Mumbai
+GET /v1/locations?category_ids=9c1e...
+GET /v1/locations?city=Mumbai&capacity_min=20
+GET /v1/locations?lat=19.0596&lng=72.8295&radius_km=10
+GET /v1/locations?north=19.2&south=18.9&east=73.0&west=72.7
+GET /v1/locations?lat=19.0596&lng=72.8295&sort=nearest
+```
+
+- `400 VALIDATION_ERROR` for any out-of-range coordinate, an over-limit `radius_km`, a partial
+  bounding box, `north <= south`/`east <= west`, `capacity_min > capacity_max`, `sort=nearest`
+  without coordinates, an invalid UUID in a tag filter, or an oversized `pageSize`.
+
+Full location detail (host info, all media, full description) is still `GET
+/v1/locations/:id`, unchanged by this phase.
 
 ### `GET /v1/locations/:id`
 
