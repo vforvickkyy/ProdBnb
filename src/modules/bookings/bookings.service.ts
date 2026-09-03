@@ -264,12 +264,27 @@ export async function listBookings(supabase: SupabaseClient, query: ListBookings
   const from = (query.page - 1) * query.pageSize;
   const to = from + query.pageSize - 1;
 
-  let request = supabase.from("bookings").select(BOOKING_DETAIL_SELECT, { count: "exact" });
+  // PostgREST only treats an embedded-resource filter as row-restricting
+  // (rather than just filtering what appears inside the nested object) when
+  // the embed is marked `!inner` -- the default embed filters the nested
+  // relation only, leaving every outer row in place regardless. Safe to
+  // switch unconditionally on host_id specifically: bookings.location_id is
+  // NOT NULL, so every booking has exactly one location, and this caller
+  // (host_id is admin-only in practice) already has full RLS visibility
+  // into locations -- an inner join here can never drop a row it shouldn't.
+  const select = query.host_id ? BOOKING_DETAIL_SELECT.replace("locations (", "locations!inner (") : BOOKING_DETAIL_SELECT;
+  let request = supabase.from("bookings").select(select, { count: "exact" });
   if (query.location_id) {
     request = request.eq("location_id", query.location_id);
   }
   if (query.status) {
     request = request.eq("status", query.status);
+  }
+  if (query.booker_id) {
+    request = request.eq("booker_id", query.booker_id);
+  }
+  if (query.host_id) {
+    request = request.eq("locations.host_id", query.host_id);
   }
 
   const { data, error, count } = await request.order("start_at", { ascending: false }).range(from, to);

@@ -25,9 +25,9 @@ export async function patchMe(req: Request, res: Response): Promise<void> {
 
 export async function listUsers(req: Request, res: Response): Promise<void> {
   const supabase = req.supabase!;
-  const { page, pageSize } = req.valid!.query as ListUsersQuery;
+  const { page, pageSize, search, role, status } = req.valid!.query as ListUsersQuery;
 
-  const { data, total } = await listAllProfiles(supabase, page, pageSize);
+  const { data, total } = await listAllProfiles(supabase, page, pageSize, { search, role, status });
 
   ok(res, data, 200, { page, pageSize, total });
 }

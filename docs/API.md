@@ -816,9 +816,60 @@ at least one required). **Disabling a category only suppresses push delivery for
 notification list is never affected**, per `docs/DATABASE.md`'s explanation of why critical
 transactional notifications can't accidentally disappear.
 
+## Admin (Phase 11)
+
+Every endpoint below requires authentication **and** the `admin` role, enforced once at the
+router level (`src/modules/admin/admin.routes.ts`) — a booker/host gets `403` from any of them,
+verified explicitly in each `tests/admin-*.test.ts` file. See
+[`docs/DATABASE.md`](DATABASE.md#admin-control--admin-panel-phase-11) for the full architecture,
+the host-suspension cascade, and the audit log. An OpenAPI 3.0 document for this surface is
+generated at `docs/admin-openapi.json` (`npm run generate:openapi`).
+
+`GET /v1/admin/dashboard` — operational summary: `total_users`, `active_hosts`,
+`published_locations`, `locations_awaiting_approval`, `upcoming_bookings`, `recent_bookings`,
+`payment_activity_30d`/`refund_activity_30d` (`{count, total_amount_minor_units}`),
+`recent_admin_actions`. Small bounded/indexed queries only — no analytics infrastructure.
+
+**Users** — `GET /v1/admin/users` (existing endpoint, extended: `?search=&role=&status=&page=&pageSize=`,
+each row now includes `roles: string[]`), `GET /v1/admin/users/:id` (profile + roles + `email`/
+`last_sign_in_at` via the Supabase Admin Auth API + `locations_count`/`bookings_count` — never
+passwords/tokens), `POST /v1/admin/users/:id/suspend` (`{"reason": "..."}`, required — cascades to
+the host's currently-published locations only, see `docs/DATABASE.md`), `POST
+/v1/admin/users/:id/restore` (no body).
+
+**Locations** — `GET /v1/admin/locations` (existing endpoint, extended: `?host_id=&search=`), `GET
+/v1/admin/locations/:id`, `POST /v1/admin/locations/:id/approve` (no body; `submitted`/
+`under_review` → `published` directly), `POST /v1/admin/locations/:id/reject` (`{"reason"}`,
+required; `submitted`/`under_review` → `rejected`), `POST /v1/admin/locations/:id/suspend`
+(`{"reason"}`, required; `published` → `suspended`), `POST /v1/admin/locations/:id/restore` (no
+body; `suspended` → `published`). Each validates its source status (`400` if invalid) and writes
+an audit entry.
+
+**Bookings** — `GET /v1/admin/bookings` (`?booker_id=&host_id=` in addition to the existing
+`?location_id=&status=`), `GET /v1/admin/bookings/:id`, `POST /v1/admin/bookings/:id/cancel`
+(`{"reason"?}`, optional — same body as the existing booker/host cancel action). All three are
+thin wrappers around the unmodified booking engine (`bookings.service.ts`) — no new cancellation
+logic, no bypass of the EXCLUDE constraint.
+
+**Payments / refunds** — `GET /v1/admin/payments` (`?status=&provider=&booking_id=`), `GET
+/v1/admin/payments/:id`, `GET /v1/admin/refunds` (`?status=`), `POST
+/v1/admin/payments/:id/refunds` — identical body/behavior to the existing `POST
+/v1/payments/:id/refunds` (Phase 7), routed through the same `PaymentService`/`PaymentProvider`
+architecture; no Cashfree-specific code exists in the admin layer, and `CASHFREE_SECRET_KEY`/raw
+provider payloads never appear in any admin response.
+
+**Notification diagnostics** — `GET /v1/admin/notifications/delivery-attempts?notification_id=`
+or `?booking_id=` (one required) — `status`/`provider`/`error_reason`/timestamps per device
+attempt only. Never returns another user's notification title/body/content.
+
+**Audit log** — `GET /v1/admin/audit-log?target_type=&target_id=&admin_id=&page=&pageSize=`. Every
+one of the 8 mutating admin actions above writes exactly one entry as its last step; there is no
+endpoint to create, edit, or delete an entry directly — see `docs/DATABASE.md` for why that's
+structurally impossible, not just unimplemented.
+
 ## What's intentionally not here yet
 
-Reviews, messaging, favorites, an admin UI, and availability-aware search are later phases — see
+Reviews, messaging, favorites, and availability-aware search are later phases — see
 the main project brief. `GET /v1/locations` (search) still does not filter by availability; a
 client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
 and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension

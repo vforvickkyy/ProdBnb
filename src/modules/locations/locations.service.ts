@@ -9,11 +9,18 @@ const FOREIGN_KEY_VIOLATION = "23503";
 // here anymore — location_pricing (Phase 6A) is the sole pricing source now.
 // The columns still exist in the database (never dropped) but the app layer
 // stops reading/writing them, so there's no way for the two to disagree.
+// moderation_reason (Phase 11) is safe to include in this shared select even
+// though it can carry admin-written text: it is only ever non-null in the
+// same UPDATE that moves status away from 'published' (reject/suspend), and
+// cleared in the same UPDATE that moves it back (approve/restore) — a
+// publicly-visible (published) row therefore always has moderation_reason
+// null by construction, never leaking anything through the public detail/
+// search response. See src/modules/admin/locations.service.ts.
 const LOCATION_COLUMNS = `
   id, host_id, title, description,
   address_line1, address_line2, city, region, country, postal_code,
   latitude, longitude, capacity, timezone, instant_booking_enabled,
-  status, created_at, updated_at
+  status, moderation_reason, created_at, updated_at
 `;
 
 const LOCATION_DETAIL_SELECT = `
@@ -54,6 +61,7 @@ export interface LocationSummary {
   timezone: string;
   instant_booking_enabled: boolean;
   status: string;
+  moderation_reason: string | null;
   created_at: string;
   updated_at: string;
   [key: string]: unknown;
@@ -208,11 +216,17 @@ export interface PaginatedLocations {
   total: number;
 }
 
+export interface LocationListFilters {
+  status?: string;
+  hostId?: string;
+  search?: string;
+}
+
 async function listLocations(
   supabase: SupabaseClient,
   page: number,
   pageSize: number,
-  filters: { status?: string; hostId?: string } = {}
+  filters: LocationListFilters = {}
 ): Promise<PaginatedLocations> {
   const from = (page - 1) * pageSize;
   const to = from + pageSize - 1;
@@ -224,6 +238,9 @@ async function listLocations(
   }
   if (filters.hostId) {
     query = query.eq("host_id", filters.hostId);
+  }
+  if (filters.search) {
+    query = query.ilike("title", `%${filters.search}%`);
   }
 
   const { data, error, count } = await query.order("created_at", { ascending: false }).range(from, to);
@@ -248,9 +265,9 @@ export function listAllLocationsForAdmin(
   supabase: SupabaseClient,
   page: number,
   pageSize: number,
-  status?: string
+  filters: LocationListFilters = {}
 ): Promise<PaginatedLocations> {
-  return listLocations(supabase, page, pageSize, status ? { status } : {});
+  return listLocations(supabase, page, pageSize, filters);
 }
 
 async function replaceTags(

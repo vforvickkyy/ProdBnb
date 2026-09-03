@@ -3,6 +3,7 @@ import express, { Express } from "express";
 import helmet from "helmet";
 import { env } from "./config/env";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
+import { adminRouter } from "./modules/admin/admin.routes";
 import { availabilityRouter } from "./modules/availability/availability.routes";
 import { bookingsRouter } from "./modules/bookings/bookings.routes";
 import { catalogRouter } from "./modules/catalog/catalog.routes";
@@ -46,6 +47,13 @@ export function createApp(): Express {
   app.use("/v1", paymentsRouter);
   app.use("/v1", devicesRouter);
   app.use("/v1", notificationsRouter);
+  // Mounted at /v1/admin specifically, not /v1 -- adminRouter's blanket
+  // requireAuth+requireRole('admin') gate (no path restriction, applied
+  // once for the whole router) would otherwise intercept every request for
+  // every router registered after it, including public ones like
+  // catalogRouter, since Express only skips a sub-router entirely when the
+  // request path doesn't match its mount prefix.
+  app.use("/v1/admin", adminRouter);
   app.use("/v1", catalogRouter);
 
   app.use(notFoundHandler);

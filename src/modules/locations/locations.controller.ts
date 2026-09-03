@@ -51,7 +51,7 @@ export async function getMyLocations(req: Request, res: Response): Promise<void>
 }
 
 export async function getAdminLocations(req: Request, res: Response): Promise<void> {
-  const { page, pageSize, status } = req.valid!.query as AdminListLocationsQuery;
-  const { data, total } = await listAllLocationsForAdmin(req.supabase!, page, pageSize, status);
+  const { page, pageSize, status, host_id, search } = req.valid!.query as AdminListLocationsQuery;
+  const { data, total } = await listAllLocationsForAdmin(req.supabase!, page, pageSize, { status, hostId: host_id, search });
   ok(res, data, 200, { page, pageSize, total });
 }

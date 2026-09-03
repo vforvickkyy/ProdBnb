@@ -100,6 +100,12 @@ export type BookingIdParam = z.infer<typeof bookingIdParamSchema>;
 export const listBookingsQuerySchema = z.object({
   location_id: uuid.optional(),
   status: bookingStatusSchema.optional(),
+  // Admin-only in practice (RLS already restricts a non-admin's results to
+  // their own rows regardless of these filters being present) — exposed on
+  // the shared schema rather than a separate admin one, since GET
+  // /v1/admin/bookings is a thin wrapper around this same query.
+  booker_id: uuid.optional(),
+  host_id: uuid.optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });

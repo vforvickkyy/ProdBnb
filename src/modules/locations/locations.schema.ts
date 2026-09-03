@@ -91,5 +91,7 @@ export type ListLocationsQuery = z.infer<typeof listLocationsQuerySchema>;
 
 export const adminListLocationsQuerySchema = listLocationsQuerySchema.extend({
   status: locationStatusSchema.optional(),
+  host_id: uuid.optional(),
+  search: z.string().trim().min(1).max(200).optional(),
 });
 export type AdminListLocationsQuery = z.infer<typeof adminListLocationsQuerySchema>;

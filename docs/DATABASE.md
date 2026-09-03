@@ -1139,6 +1139,134 @@ device, synchronously, at creation time. A `failed`/`invalid_token` result is re
 there; a future phase could re-scan failed attempts, but that's an isolated, additive extension,
 not built now, and this repo has no existing queue to plug one into anyway.
 
+## Admin Control + Admin Panel (Phase 11)
+
+**The core finding**: most of what this phase needs already existed. `updateLocation()` already
+let admin set any of the 8 lifecycle statuses; `cancelBooking()` already accepted an admin caller
+regardless of ownership; `createRefund()` was already admin-only; RLS on `bookings`/`payments`/
+`payment_refunds`/`locations`/`profiles` already had a `has_role(auth.uid(),'admin')` branch
+granting an admin's own request-scoped client full read access. Phase 11 is a purpose-built
+`/v1/admin/*` namespace over that existing capability, plus one genuinely new thing: an immutable
+audit log. No booking/payment/availability invariant changed.
+
+### `public.admin_audit_log`
+
+Append-only, like `payment_webhook_events`/`notification_delivery_attempts` — no `updated_at`, no
+trigger, never mutated after insert.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `admin_id` | `uuid` | `references profiles(id)` |
+| `action` | `text` | `check in (...)` — a closed set matching exactly the 8 mutating admin actions this phase implements: `ADMIN_APPROVED_LOCATION`, `ADMIN_REJECTED_LOCATION`, `ADMIN_SUSPENDED_LOCATION`, `ADMIN_RESTORED_LOCATION`, `ADMIN_SUSPENDED_USER`, `ADMIN_RESTORED_USER`, `ADMIN_CANCELLED_BOOKING`, `ADMIN_CREATED_REFUND` |
+| `target_type` | `text` | `check in ('location','user','booking','payment')` |
+| `target_id` | `uuid` | |
+| `reason`, `metadata` | nullable / `jsonb` | |
+| `created_at` | `timestamptz` | |
+
+**No `INSERT`/`UPDATE`/`DELETE` grant to `authenticated` at all** — every entry is written by
+`writeAuditLog()` (`src/modules/admin/audit.service.ts`) using `adminClient`, as the last step of
+a successful privileged mutation. There is no client-writable path to create, edit, or erase an
+entry through any API — not even for the admin who performed the action, verified directly in
+`tests/admin-audit-log.test.ts` by attempting raw inserts/updates/deletes with an admin's own
+bearer token against PostgREST and confirming they're rejected. `SELECT` is admin-only, RLS-scoped
+(`has_role(auth.uid(),'admin')`, no per-admin restriction — every admin sees every entry, since
+accountability across the whole admin team is the point).
+
+### Location moderation and the `approved` status decision
+
+`approve`/`reject`/`suspend`/`restore` (`src/modules/admin/locations.service.ts`) are thin,
+validated wrappers around the same `locations.status` `UPDATE` the generic `PATCH
+/v1/locations/:id` admin path already used — no duplicate status system, no new lifecycle states.
+**Decision**: `approve` moves `submitted`/`under_review` directly to `published` — there is no
+separate `approved`-then-`publish` two-step (the `approved` status value still exists in the
+`CHECK` constraint for schema compatibility, simply unused by this phase's own actions). Each
+action validates its source status (e.g. `reject` only from `submitted`/`under_review`, `suspend`
+only from `published`) and throws `400` otherwise. `reject`/`suspend` require a `reason`;
+`approve`/`restore` do not (undoing/advancing a state positively doesn't need justification the
+way a rejection/suspension does).
+
+`locations.moderation_reason` (new, nullable column) holds the *current* explanation shown to the
+owning host — set on reject/suspend, cleared on approve/restore. The full historical record of
+every reason ever given lives in `admin_audit_log`; this column is not a second status system,
+just one explanatory field alongside the existing `status` column. It is safe to include in the
+shared `LOCATION_COLUMNS`/public detail select (rather than a separate admin-only query) because
+of an invariant enforced at every call site: it is only ever non-null in the *same* `UPDATE` that
+moves `status` away from `published`, and cleared in the *same* `UPDATE` that moves it back — a
+publicly-visible (`published`) row therefore always has `moderation_reason: null` by construction,
+verified explicitly in `tests/admin-locations.test.ts`.
+
+### Host suspension and `locations.suspended_by_host_suspension`
+
+Suspending a user (`src/modules/admin/users.service.ts#suspendUser`) sets `profiles.status =
+'suspended'` and, as a cascade, moves every one of that host's *currently-`published`* locations
+to `suspended`, marking each with the new boolean column `suspended_by_host_suspension = true` and
+a generic `moderation_reason`. Locations already in any other state — draft, submitted,
+independently-suspended, rejected, archived — are **never touched**. Restoring the user reverses
+this: only locations where `suspended_by_host_suspension = true` are moved back to `published`
+(flag and reason cleared); a location an admin independently suspended for its own reason (flag
+stays `false`) is never touched by a host restore, even if it happens to be `suspended` at the
+same time. The per-location `suspend`/`restore` actions always set the flag to `false` — any
+deliberate admin action on a specific location marks it as independent, so it's both skipped by a
+later host-suspend cascade (it's no longer `published`) and never auto-restored by a later
+host-restore. `approveLocation()` additionally refuses to approve a submitted location whose host
+is currently suspended (`400`) — otherwise a location could be approved straight into "published,
+but the host who'd manage it can't be reached." Existing confirmed bookings, payments, and
+availability history are never touched by either suspend or restore — a suspended host's
+locations simply stop being `published` (and therefore stop being bookable, since booking
+creation already requires `status = 'published'` — no new check needed there), nothing about
+already-existing rows changes. See `tests/admin-locations.test.ts`'s "host suspension cascade"
+tests for the exact behavior verified.
+
+### `profiles.status` is now enforced
+
+Phase 1's `profiles.status` (`active`/`suspended`/`deleted`) existed but was checked nowhere.
+`requireAuth` (`src/middleware/auth.ts`) now fetches it alongside identity resolution and rejects
+(`403`) a non-`'active'` caller before any route-specific authorization runs. Every existing user
+defaults to `'active'`, so this was a no-op for the entire pre-Phase-11 test suite (verified: all
+225 prior tests passed unmodified with this check in place before any new admin code existed).
+`profiles.status` itself has no column-level `UPDATE` grant to `authenticated` at all (Phase 1: "so
+profile updates can never self-escalate account status") — only `service_role` can write it, for
+any user including an admin's own row, which is why suspend/restore go through `adminClient`
+rather than the admin's own request-scoped client.
+
+### RLS/service-layer summary
+
+| Data | Read path | Write path |
+|---|---|---|
+| `admin_audit_log` | caller's own client (RLS: admin-only) | `adminClient` only (`writeAuditLog`) |
+| `bookings`/`payments`/`payment_refunds` listings | caller's own client (existing `has_role(admin)` RLS branch — no new policy needed) | thin wrappers around existing, unmodified service functions |
+| `locations` moderation | caller's own client (existing `locations_update_own_or_admin` RLS already covers admin) | caller's own client |
+| `profiles.status` (suspend/restore) | caller's own client | `adminClient` (no column grant exists for `authenticated`) |
+| `notification_delivery_attempts` | `adminClient` only (Phase 8: zero `authenticated` access on this table) | n/a (read-only diagnostics) |
+| Email/last-sign-in (`GET /v1/admin/users/:id`) | Supabase Admin Auth API (`adminClient.auth.admin.getUserById`) — `profiles` has no email column by design | n/a |
+
+No existing RLS policy was weakened anywhere in this phase.
+
+### Admin router mounting — a real gotcha worth documenting
+
+`adminRouter` is mounted at `app.use("/v1/admin", adminRouter)`, **not** `app.use("/v1",
+adminRouter)`, even though every route inside it is written without the `/admin` prefix (e.g.
+`adminRouter.get("/dashboard", ...)`). The router-level `adminRouter.use(requireAuth,
+requireRole("admin"))` gate has no path restriction, so it runs for *every* request that reaches
+this router at all — mounting it at the bare `/v1` prefix would have made that gate intercept
+every request for every router registered after it in `app.ts` (including public ones like
+`catalogRouter`), since Express only skips a sub-router entirely when the request path doesn't
+match its own mount prefix, not when no route inside it matches. This was caught during Phase 11's
+own implementation (all public catalog endpoints started 401ing) before it ever shipped, but is
+exactly the kind of subtle Express composition bug worth a permanent comment, not just a fixed
+diff.
+
+### Admin API contract (OpenAPI)
+
+`/v1/admin/*`'s zod schemas (`src/modules/admin/admin.schema.ts` and the admin-relevant schemas
+reused from `bookings`/`locations`/`payments`/`users`) are the source for a generated OpenAPI 3.0
+document — see `docs/admin-openapi.json` and `scripts/generate-openapi.ts`. Not retrofitted across
+the other ~50 existing endpoints from Phases 1–8; scoped to the admin surface only, since that's
+the one with a new, separate frontend consumer that benefits from generated types. The Admin
+Panel project generates its own TypeScript request/response types from this document rather than
+hand-copying shapes between the two repositories.
+
 ## Granting the admin role
 
 There's no endpoint for this — deliberately. `admin` is powerful enough that granting it should
