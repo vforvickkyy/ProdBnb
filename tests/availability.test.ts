@@ -330,4 +330,53 @@ describe("availability", () => {
       expect(res.status).toBe(401);
     });
   });
+
+  describe("booking integration (Phase 6)", () => {
+    let locationId: string;
+    let bookerUser: TestUser;
+
+    beforeAll(async () => {
+      bookerUser = await createTestUser();
+      const grant = await request(app).post("/v1/me/roles").set(authHeader(bookerUser)).send({ role: "booker" });
+      expect(grant.status).toBe(201);
+
+      locationId = await createLocation(host);
+      await request(app)
+        .post(`/v1/locations/${locationId}/availability/rules`)
+        .set(authHeader(host))
+        .send({ day_of_week: "monday", start_time: "10:00", end_time: "18:00" });
+      const { error } = await adminClient.from("locations").update({ base_price_minor_units: 5000 }).eq("id", locationId);
+      if (error) throw error;
+      await publish(locationId);
+    });
+
+    afterAll(async () => {
+      await deleteTestUser(bookerUser.id);
+    });
+
+    it("an active booking removes its interval from computed availability, and cancelling restores it", async () => {
+      const before = await request(app).get(`/v1/locations/${locationId}/availability`).query({ from: MONDAY, to: MONDAY });
+      expect(before.body.data[0].windows).toHaveLength(1);
+      expect(new Date(before.body.data[0].windows[0].start).toISOString()).toBe("2026-10-05T10:00:00.000Z");
+      expect(new Date(before.body.data[0].windows[0].end).toISOString()).toBe("2026-10-05T18:00:00.000Z");
+
+      const booking = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(bookerUser))
+        .send({ location_id: locationId, start_at: "2026-10-05T13:00:00Z", end_at: "2026-10-05T15:00:00Z" });
+      expect(booking.status).toBe(201);
+
+      const during = await request(app).get(`/v1/locations/${locationId}/availability`).query({ from: MONDAY, to: MONDAY });
+      expect(during.body.data[0].windows).toHaveLength(2);
+      expect(new Date(during.body.data[0].windows[0].end).toISOString()).toBe("2026-10-05T13:00:00.000Z");
+      expect(new Date(during.body.data[0].windows[1].start).toISOString()).toBe("2026-10-05T15:00:00.000Z");
+
+      await request(app).post(`/v1/bookings/${booking.body.data.id}/cancel`).set(authHeader(bookerUser));
+
+      const after = await request(app).get(`/v1/locations/${locationId}/availability`).query({ from: MONDAY, to: MONDAY });
+      expect(after.body.data[0].windows).toHaveLength(1);
+      expect(new Date(after.body.data[0].windows[0].start).toISOString()).toBe("2026-10-05T10:00:00.000Z");
+      expect(new Date(after.body.data[0].windows[0].end).toISOString()).toBe("2026-10-05T18:00:00.000Z");
+    });
+  });
 });

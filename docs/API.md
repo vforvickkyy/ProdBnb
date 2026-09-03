@@ -228,6 +228,9 @@ visible only to the owning host or an admin — otherwise `404` (existence isn't
     "longitude": -0.0775,
     "capacity": 40,
     "timezone": "Europe/London",
+    "base_price_minor_units": 15000,
+    "currency": "INR",
+    "instant_booking_enabled": false,
     "status": "published",
     "created_at": "2026-09-03T12:00:00Z",
     "updated_at": "2026-09-03T12:00:00Z",
@@ -255,6 +258,9 @@ optional `category_ids`/`amenity_ids`/`use_case_ids` (arrays of UUIDs from
 `GET /v1/categories`/`/v1/amenities`/`/v1/use-cases`). `timezone` (Phase 5) is an IANA identifier
 (e.g. `"Asia/Kolkata"`, never an abbreviation like `IST`) — defaults to `"UTC"` if omitted, and
 is what every availability window (`GET /v1/locations/:id/availability`) is interpreted against.
+`base_price_minor_units` (Phase 6, e.g. paise for `INR`) is an hourly rate — a location with no
+price set cannot be booked; `currency` defaults to `"INR"`; `instant_booking_enabled` (default
+`false`) skips host approval when set — see [`docs/DATABASE.md`](DATABASE.md#pricing-one-hourly-rate-applied-uniformly).
 
 Request:
 
@@ -472,10 +478,102 @@ all (not even indirectly via a raw REST call with the anon key).
 
 - `409 CONFLICT` if the period overlaps an existing block for this location.
 
+## Bookings (Phase 6)
+
+**Availability is not booking.** `GET /v1/locations/:id/availability` (above) tells a client what
+times are open; the endpoints below actually reserve one. See
+[`docs/DATABASE.md`](DATABASE.md#booking-engine--pricing-foundation-phase-6) for the full
+architecture — the atomic double-booking guarantee, the multi-day check-in/check-out model, and
+the pricing/currency reasoning.
+
+**Timezone**: `start_at`/`end_at` are full ISO-8601 timestamps **with an explicit offset**
+(e.g. `"2026-10-05T13:00:00+05:30"`), the same convention `location_blocked_periods` already
+uses. The client resolves "1pm at this location" to a real instant using the location's own
+`timezone` field (in every location response) *before* sending it — the backend only ever
+validates an already-unambiguous instant, it never guesses one from a device's local timezone.
+
+### `POST /v1/bookings`
+
+Requires authentication **and** the `booker` role.
+
+Request: `{ "location_id": "...", "start_at": "2026-10-05T09:00:00Z", "end_at": "2026-10-05T11:00:00Z" }`
+
+Response (`201`): the booking detail object (below). Created as `status: "confirmed"`
+immediately if the location has `instant_booking_enabled: true`, otherwise `"requested"`
+(host approval required).
+
+- `400 VALIDATION_ERROR` — the location has no price set, or the requested interval isn't
+  available (outside operating hours, inside a blocked period, or conflicts with another active
+  booking — checked, but not the source of the actual guarantee, see `docs/DATABASE.md`).
+- `403 FORBIDDEN` — caller doesn't hold the `booker` role.
+- `404 NOT_FOUND` — the location doesn't exist or isn't published.
+- `409 CONFLICT` — a concurrent request won the exact same interval first. This is the real
+  double-booking guarantee firing, not a bug — a well-behaved client should let the booker pick a
+  different time and retry.
+
+### `GET /v1/bookings`
+
+Requires authentication. RLS-scoped automatically: a booker sees their own bookings, a host sees
+bookings on locations they own, an admin sees all — no role param needed. Optional
+`?location_id=`/`?status=` filters, standard `page`/`pageSize` pagination.
+
+### `GET /v1/bookings/:id`
+
+Requires authentication. Same RLS scoping as the list endpoint; `404` if not visible to the
+caller.
+
+```json
+{
+  "data": {
+    "id": "...",
+    "location": { "id": "...", "title": "East London Film Studio", "city": "London", "timezone": "Europe/London" },
+    "booker_id": "...",
+    "start_at": "2026-10-05T09:00:00+00:00",
+    "end_at": "2026-10-05T11:00:00+00:00",
+    "status": "confirmed",
+    "pricing": {
+      "base_amount_minor_units": 20000, "platform_fee_minor_units": 0,
+      "tax_minor_units": 0, "discount_minor_units": 0,
+      "total_amount_minor_units": 20000, "currency": "INR"
+    },
+    "created_at": "...", "updated_at": "...",
+    "cancelled_at": null, "cancelled_by": null, "cancellation_reason": null
+  }
+}
+```
+
+`location` is a compact summary, not the full location object. `pricing` is the snapshot taken
+at booking time — it never changes even if the location's price does later. Amounts are integer
+minor units (e.g. paise for `INR`), never floating point.
+
+### Lifecycle actions
+
+| Method | Path | Who | Valid from |
+|---|---|---|---|
+| POST | `/v1/bookings/:id/confirm` | host (own location) or admin | `requested` → `confirmed` |
+| POST | `/v1/bookings/:id/reject` | host or admin | `requested` → `rejected` |
+| POST | `/v1/bookings/:id/cancel` | booker (own), host (own location), or admin | `requested`/`confirmed` → `cancelled` |
+| POST | `/v1/bookings/:id/complete` | host or admin | `confirmed` → `completed` |
+
+`reject`/`cancel` accept an optional body `{ "reason": "..." }`, stored as
+`cancellation_reason` — omit the body entirely, an empty object, or a `reason` are all valid.
+
+- `400 VALIDATION_ERROR` if the booking isn't currently in a status the requested transition
+  allows (e.g. confirming an already-cancelled booking).
+- `403 FORBIDDEN` if the caller isn't authorized for that specific action (e.g. a booker trying
+  to confirm their own booking — only a host/admin can).
+- `404 NOT_FOUND` if the booking doesn't exist or isn't visible to the caller at all.
+
+Cancelling releases the interval immediately — the same time can be booked again the instant the
+`cancel` request completes, since the exclusion constraint stops considering a cancelled
+booking's interval the moment its status changes.
+
 ## What's intentionally not here yet
 
-Bookings, payments, reviews, messaging, notifications, and availability-aware search are later
-phases — see the main project brief. `GET /v1/locations` (search) does not filter by
-availability yet; a client currently checks a candidate location's availability separately via
-`GET /v1/locations/:id/availability`. Video transcoding, image processing, and AI analysis remain
-out of scope for the R2 integration.
+Payment (a payment gateway, refunds, host payouts — Phase 7), reviews, messaging, notifications,
+favorites, an admin UI, and availability-aware search are later phases — see the main project
+brief. `GET /v1/locations` (search) still does not filter by availability; a client checks a
+candidate location's availability separately via `GET /v1/locations/:id/availability` and books
+via `POST /v1/bookings`. Booking `status` and payment status are deliberately separate concepts
+— Phase 7 adds its own payment fields to `bookings` without touching booking lifecycle at all.
+Video transcoding, image processing, and AI analysis remain out of scope for the R2 integration.

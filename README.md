@@ -7,12 +7,14 @@ and **Web**.
 Phase 1 (core foundation, authentication, user profiles, roles), Phase 2 (locations/listings —
 the marketplace inventory a host lists), Phase 3 (Cloudflare R2 media — direct-to-storage
 photo/video upload), Phase 4 (search & discovery — PostgreSQL/PostGIS-backed text search,
-geographic search, and filtering), and Phase 5 (availability & calendar — weekly schedules, date
-overrides, blocked periods, and timezone-aware computed availability) are done. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md), and
-[`docs/API.md`](docs/API.md) for the full picture. Availability is not booking — see
-[`docs/DATABASE.md`](docs/DATABASE.md#availability--calendar-phase-5) for how Phase 6 will build
-on it.
+geographic search, and filtering), Phase 5 (availability & calendar — weekly schedules, date
+overrides, blocked periods, and timezone-aware computed availability), and Phase 6 (booking
+engine + pricing foundation — atomic double-booking prevention, price snapshots, booking
+lifecycle) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+[`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
+Booking payment is Phase 7 — see
+[`docs/DATABASE.md`](docs/DATABASE.md#booking-engine--pricing-foundation-phase-6) for the exact
+extension point.
 
 ## Stack
 
@@ -73,8 +75,8 @@ docs/               Architecture, database, and API documentation
 ```
 
 Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`,
-`search`, `availability`). Future features (bookings, payments, …) are added the same way, as
-new module folders, without touching existing ones.
+`search`, `availability`, `bookings`). Future features (payments, notifications, …) are added the
+same way, as new module folders, without touching existing ones.
 
 ## Scripts
 

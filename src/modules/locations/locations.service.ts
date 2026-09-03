@@ -1,5 +1,5 @@
 import { SupabaseClient } from "@supabase/supabase-js";
-import { ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
 import { publicUrlFor } from "../../lib/r2";
 import { CreateLocationInput, UpdateLocationInput } from "./locations.schema";
 
@@ -8,7 +8,9 @@ const FOREIGN_KEY_VIOLATION = "23503";
 const LOCATION_COLUMNS = `
   id, host_id, title, description,
   address_line1, address_line2, city, region, country, postal_code,
-  latitude, longitude, capacity, timezone, status, created_at, updated_at
+  latitude, longitude, capacity, timezone,
+  base_price_minor_units, currency, instant_booking_enabled,
+  status, created_at, updated_at
 `;
 
 const LOCATION_DETAIL_SELECT = `
@@ -46,6 +48,9 @@ export interface LocationSummary {
   longitude: number | null;
   capacity: number | null;
   timezone: string;
+  base_price_minor_units: number | null;
+  currency: string;
+  instant_booking_enabled: boolean;
   status: string;
   created_at: string;
   updated_at: string;
@@ -348,6 +353,11 @@ export async function deleteLocation(
 
   const { error } = await supabase.from("locations").delete().eq("id", locationId);
   if (error) {
+    // bookings.location_id deliberately has no ON DELETE CASCADE — a
+    // location with any booking history can't be deleted out from under it.
+    if (error.code === FOREIGN_KEY_VIOLATION) {
+      throw new ConflictError("Cannot delete a location with existing bookings.");
+    }
     throw error;
   }
 }

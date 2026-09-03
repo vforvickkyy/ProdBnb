@@ -17,6 +17,10 @@ export const ianaTimezoneSchema = z.string().refine(
   { message: "Must be a valid IANA timezone identifier, e.g. 'Asia/Kolkata'." }
 );
 
+// ISO-4217-shaped, not a fixed allowlist — keeps international expansion
+// from requiring a migration, while still rejecting obvious garbage.
+export const currencySchema = z.string().regex(/^[A-Z]{3}$/, "Must be a 3-letter ISO currency code, e.g. 'INR'.");
+
 export const locationStatusSchema = z.enum([
   "draft",
   "submitted",
@@ -42,6 +46,9 @@ export const createLocationSchema = z
     longitude: z.number().min(-180).max(180).nullable().optional(),
     capacity: z.number().int().positive().nullable().optional(),
     timezone: ianaTimezoneSchema.optional(),
+    base_price_minor_units: z.number().int().nonnegative().nullable().optional(),
+    currency: currencySchema.optional(),
+    instant_booking_enabled: z.boolean().optional(),
     category_ids: z.array(uuid).max(20).default([]),
     amenity_ids: z.array(uuid).max(30).default([]),
     use_case_ids: z.array(uuid).max(10).default([]),
@@ -64,6 +71,9 @@ export const updateLocationSchema = z
     longitude: z.number().min(-180).max(180).nullable().optional(),
     capacity: z.number().int().positive().nullable().optional(),
     timezone: ianaTimezoneSchema.optional(),
+    base_price_minor_units: z.number().int().nonnegative().nullable().optional(),
+    currency: currencySchema.optional(),
+    instant_booking_enabled: z.boolean().optional(),
     category_ids: z.array(uuid).max(20).optional(),
     amenity_ids: z.array(uuid).max(30).optional(),
     use_case_ids: z.array(uuid).max(10).optional(),

@@ -415,7 +415,7 @@ construction logic lives in exactly one place.
 
 **Availability is not booking.** Nothing in this phase reserves a slot — it answers "is this
 location available at this time?" via a weekly schedule, date-specific overrides, and blocked
-periods. Bookings arrive in Phase 6 (see "Booking compatibility" below).
+periods. Phase 6 (below) adds bookings as one more subtraction step on top of this same engine.
 
 ### Timezone
 
@@ -481,8 +481,9 @@ Phase 4 used to justify *not* adding a primary-media index.
 
 Per the design brief: application-level pre-checks alone can race under concurrent requests.
 Both `location_availability_rules` and `location_blocked_periods` use Postgres `EXCLUDE USING
-gist` constraints — the same double-booking-prevention technique Phase 6's `bookings` table will
-reuse (see below). Both need the `btree_gist` extension (installed alongside `postgis`, in the
+gist` constraints — the same double-booking-prevention technique Phase 6's `bookings` table
+reuses below, with a `WHERE` clause added since only some booking statuses reserve the interval.
+Both need the `btree_gist` extension (installed alongside `postgis`, in the
 `extensions` schema) — a `GiST` exclusion constraint that mixes a plain equality column
 (`location_id`, `day_of_week`) with a range column needs it. `time` has no native Postgres range
 type, so the rules constraint expresses each window as `int4range(seconds-since-midnight,
@@ -552,15 +553,158 @@ belt-and-suspenders pattern `least(_page_size, 100)` uses in `search_locations`.
 - Every new table gets explicit `GRANT`s for `authenticated` and `service_role` from the start —
   the Phase 1 lesson, applied on day one this time.
 
-### Booking compatibility (Phase 6 — not built yet)
+## Booking Engine + Pricing Foundation (Phase 6)
 
-A future `bookings` table gets its own `EXCLUDE USING gist (location_id WITH =,
-tstzrange(start_at, end_at, '[)') WITH &&, ...)` constraint against other *confirmed* bookings
-for the same location — the exact technique this phase already uses for rules/blocks — so
-double-booking is prevented atomically at insert time, not via a "check availability, then
-insert" race, which can't be made safe at the application layer alone under concurrent requests.
-`get_location_availability()` gains one more subtraction step (confirmed bookings, alongside
-blocks) at that point; its signature and the rules/overrides/blocks tables don't need to change.
+**The critical requirement**: two users requesting the same location and overlapping interval at
+nearly the same instant must never both end up with an active booking. This is guaranteed by a
+Postgres constraint, not by application code checking first and inserting second — a "check then
+insert" is inherently racy under concurrency, since two concurrent requests can both pass the
+check before either one inserts.
+
+### `bookings`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `location_id` | `uuid` | `references locations(id)` — **no `on delete cascade`**, unlike every other FK to `locations` in this schema (see below) |
+| `booker_id` | `uuid` | `references profiles(id) on delete cascade` |
+| `start_at`, `end_at` | `timestamptz` | absolute instants; `check (end_at > start_at)` |
+| `status` | `text` | `check in ('requested','confirmed','cancelled','completed','rejected')`, default `'requested'` |
+| `base_amount_minor_units` | `integer` | the price snapshot — see "Pricing" below |
+| `platform_fee_minor_units`, `tax_minor_units`, `discount_minor_units` | `integer`, default `0` | unused this phase (always `0`), structurally ready for Phase 7 |
+| `total_amount_minor_units` | `integer` | `check (= base + platform_fee + tax - discount)` |
+| `currency` | `text` | copied from the location *at booking time* — a snapshot, not a live reference |
+| `cancelled_at`, `cancelled_by`, `cancellation_reason` | nullable | set only by the cancel action |
+
+### Double-booking prevention: a partial `EXCLUDE` constraint
+
+```sql
+exclude using gist (
+  location_id with =,
+  tstzrange(start_at, end_at, '[)') with &&
+) where (status in ('requested', 'confirmed'))
+```
+
+The same `EXCLUDE USING gist` technique Phase 5 established for
+`location_availability_rules`/`location_blocked_periods`, reusing the same `btree_gist`
+extension already installed. The `WHERE` clause is what makes it a *partial* exclusion
+constraint — only `requested`/`confirmed` rows participate, so a `cancelled`/`rejected` booking's
+old interval becomes instantly reusable the moment its status changes (no row deletion needed,
+full booking history preserved). **Verified directly against the local stack with two genuinely
+concurrent raw inserts** for the identical interval before this was ever wired into Express: one
+returned `201`, the other failed with Postgres error code `23P01`
+(`exclusion_violation`) — mapped to `409 CONFLICT` in `bookings.service.ts`.
+
+**Why `requested` reserves the slot, not just `confirmed`**: if only `confirmed` bookings
+blocked the interval, two different bookers could both successfully *request* the same
+overlapping time, leaving the host to arbitrarily resolve a conflict that should never have been
+possible to create. Requesting already holds the slot; a host's `confirm`/`reject` decides
+whether that hold becomes permanent or releases.
+
+### `is_interval_available()` — the pre-check, not the guarantee
+
+`POST /v1/bookings` calls `is_interval_available(location_id, start_at, end_at)` *before*
+attempting the insert, purely to produce a clean `400` ("not available") instead of always
+racing to find out via a `409`. It is not what makes double-booking impossible — the exclusion
+constraint above is authoritative regardless of what this function decides, and stays correct
+even if this pre-check were deleted entirely.
+
+It reuses `get_location_availability()` rather than re-deriving schedule logic, composed
+differently depending on the request shape:
+
+- **Same calendar day**: `start_at` and `end_at` must fall within the *same* returned window
+  (strict containment) — without this, a request from `11:00` to `15:00` against windows
+  `09:00–12:00` and `14:00–18:00` would wrongly pass a looser "start in some window, end in some
+  window" check despite the `12:00–14:00` gap sitting in the middle.
+- **Multi-day ("continuous custody" model)**: check-in (`start_at`) must fall within an available
+  window on its calendar day; check-out (`end_at`) must fall within an available window on *its*
+  calendar day; and a separate helper, `has_conflicting_period()`, checks the *entire* span for
+  any overlapping blocked period or other active booking, independent of day boundaries (the
+  day-by-day windowing alone can't see a conflict sitting on a day in the middle of a multi-day
+  request). Intermediate days impose no operating-hours requirement of their own — once checked
+  in, the booker has continuous exclusive use through checkout. This is a deliberate design
+  choice, not an obvious reading of the product spec: Phase 5's `time`-typed weekly rules can't
+  express "open through midnight," so requiring every intermediate day to match a full 24-hour
+  window is a dead end without reworking Phase 5's schema entirely.
+
+`has_conflicting_period()` is `SECURITY DEFINER` (needs to read block times regardless of the
+caller, the same reasoning `get_location_availability()` already established) but is **not**
+granted `EXECUTE` directly to `anon`/`authenticated` — it's only ever called from within
+`is_interval_available()`'s own body, never invoked as a public RPC on its own.
+
+### `get_location_availability()` — one more subtraction step
+
+Extended (via `CREATE OR REPLACE`, same function, same signature, same `(date, start_at,
+end_at)` return shape) to also subtract `bookings` with `status in ('requested','confirmed')`,
+using the identical per-day overlap-filter and `tstzmultirange` subtraction the blocked-periods
+loop already used. This is what makes `GET /v1/locations/:id/availability` correctly stop
+showing booked time with no change to its API contract, and it never leaks booker identity or
+pricing — the return shape is still just three columns.
+
+### Pricing: one hourly rate, applied uniformly
+
+`locations.base_price_minor_units` (nullable integer — a location with no price set cannot be
+booked) is a flat **hourly** rate. `total = round(base_price_minor_units * duration_hours)`,
+where `duration_hours` is the raw elapsed wall-clock time between `start_at`/`end_at` — the same
+formula whether the booking is two hours or three days, no special-casing per calendar day. This
+is deliberately the smallest pricing model that already works for hourly, day-wise, and
+multi-day bookings alike; a tiered day-rate (e.g. a discount past 8 hours) is a natural, isolated
+change to this one calculation later, not a reason to add a second pricing table now.
+
+**Currency**: `text`, `check (currency ~ '^[A-Z]{3}$')` — an ISO-4217 *shape*, not a fixed
+allowlist of specific currencies, so supporting a new one is never a migration. Defaults to
+`'INR'`. **Minor units** (e.g. paise), never floating point — avoids all floating-point rounding
+error by construction, and matches how real payment processors (Stripe, Razorpay) represent
+amounts, which will matter once Phase 7 has to hand this number to one.
+
+### Price snapshot
+
+`bookings` copies `base_amount_minor_units`/`currency` from the location *at booking time* and
+never recomputes them from the location's current price — a host changing their rate tomorrow
+does not change what an existing booking shows today. `platform_fee_minor_units`/
+`tax_minor_units`/`discount_minor_units` exist now (always `0`) so Phase 7 can populate real
+values without a schema change; `total_amount_minor_units` has its own `CHECK` tying it to the
+other four, so the snapshot can never become internally inconsistent.
+
+### `instant_booking_enabled`
+
+`locations.instant_booking_enabled boolean not null default false` — honored immediately, not
+just stored for later: `POST /v1/bookings` creates as `confirmed` right away when set, `requested`
+otherwise. A pure host preference (skip approval), not payment-dependent — every booking goes
+through the identical atomic conflict-prevention path regardless of which status it starts in.
+
+### Why `bookings.location_id` doesn't cascade-delete
+
+Every other foreign key to `locations` in this schema cascades (categories, amenities, media,
+availability rules, blocks). `bookings` is the one deliberate exception: deleting a location
+with booking history would silently destroy financial/historical records. Attempting to delete a
+location that has any bookings now fails with a foreign-key violation, which
+`locations.service.ts` maps to a clean `409 CONFLICT` ("Cannot delete a location with existing
+bookings") instead of leaking a raw database error as a `500`.
+
+### RLS
+
+- **`SELECT`**: `booker_id = auth.uid() or exists (select 1 from locations where host_id =
+  auth.uid() and id = location_id) or has_role(auth.uid(),'admin')` — a booker sees their own
+  bookings, a host sees bookings on locations they own, an admin sees everything.
+- **`INSERT`**: `booker_id = auth.uid() and has_role(auth.uid(),'booker')` — the same
+  "create a new resource for yourself" shape `locations`' own `INSERT` policy uses for
+  `host_id`/`has_role(...,'host')`; the app layer also gates `POST /v1/bookings` with
+  `requireRole('booker')`, since there's no existing row yet to check ownership against.
+- **`UPDATE`**: same three-way visibility condition as `SELECT` — RLS only answers "can this
+  caller touch this row at all." *Which* specific transition (confirm/reject/cancel/complete) a
+  given caller may perform is enforced in `bookings.service.ts`, not RLS, the same
+  separation-of-concerns Phase 2 already established for location status transitions.
+- No `DELETE` policy at all — bookings are never hard-deleted.
+
+### Phase 7 extension point: payment is a separate concept, not built yet
+
+No `payment_status` column exists in this phase — not even an empty placeholder. Booking
+`status` (lifecycle: requested/confirmed/cancelled/completed/rejected) and payment status are
+kept as entirely separate concerns simply by both existing as independent column sets rather
+than one conflated enum; Phase 7 will add its own `payment_status`, transaction ID, provider, and
+refund columns to `bookings` without touching anything documented above. Booking creation in
+this phase never depends on any external payment API.
 
 ## Granting the admin role
 
