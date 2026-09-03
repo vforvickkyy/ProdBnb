@@ -783,14 +783,179 @@ bookings") instead of leaking a raw database error as a `500`.
   separation-of-concerns Phase 2 already established for location status transitions.
 - No `DELETE` policy at all — bookings are never hard-deleted.
 
-### Phase 7 extension point: payment is a separate concept, not built yet
+### Payment is a separate concept (Phase 7)
 
-No `payment_status` column exists in this phase — not even an empty placeholder. Booking
-`status` (lifecycle: requested/confirmed/cancelled/completed/rejected) and payment status are
-kept as entirely separate concerns simply by both existing as independent column sets rather
-than one conflated enum; Phase 7 will add its own `payment_status`, transaction ID, provider, and
-refund columns to `bookings` without touching anything documented above. Booking creation in
-this phase never depends on any external payment API.
+Booking `status` (lifecycle: requested/confirmed/cancelled/completed/rejected) and payment status
+are kept as entirely separate concerns — Phase 7 added a standalone `payments` table (see below)
+rather than a `payment_status` column on `bookings` itself. A payment is a bolt-on financial
+record attached to an existing booking; nothing about `bookings` — its schema, its RLS, or its
+lifecycle actions — changed to make Phase 7 possible, and booking creation still never depends on
+any external payment API succeeding.
+
+## Payment Architecture + Cashfree Integration (Phase 7)
+
+**The explicit goal**: a provider-agnostic payment layer, not "Cashfree wired into the booking
+flow." `payment.service.ts` never imports anything Cashfree-specific, and `bookings.service.ts`
+never imports anything payment-specific — the two modules only meet at `bookings.total_amount_minor_units`/
+`currency` (Phase 6/6A's own immutable price snapshot), which `payment.service.ts` reads and never
+recomputes.
+
+```
+POST /v1/bookings/:id/payment
+        |
+PaymentService (src/modules/payments/payment.service.ts)
+        |
+PaymentProvider interface (src/modules/payments/providers/PaymentProvider.ts)
+        |
+CashfreeProvider (src/modules/payments/providers/CashfreeProvider.ts)  --  Cashfree TEST/sandbox
+```
+
+Adding a second provider (e.g. Razorpay) later means: one new value in `PaymentProviderName`, one
+new adapter file implementing the same `PaymentProvider` interface, one small additive migration
+extending the `provider` `CHECK` constraints on `payments`/`payment_webhook_events`, and wiring it
+into `providers/index.ts` (which resolves the active provider from `PAYMENT_PROVIDER`). **Nothing
+above the `PaymentProvider` interface — routes, service, database shape — changes.** Changing the
+*active* provider requires implementing/configuring that provider's adapter and webhook
+integration; Cashfree and Razorpay credentials are never interchangeable with each other.
+
+### Booking status is not gated on payment
+
+`POST /v1/bookings/:id/payment` works on any booking whose status is still `requested` or
+`confirmed` — payment succeeding or failing never touches `bookings.status`. The existing
+confirm/reject/cancel/complete actions remain the only things that change it, exactly as in
+Phase 6A. This is a deliberate choice, not an oversight: `instant_booking_enabled` locations
+already go straight to `confirmed` at creation, before any payment exists — `confirmed` there
+means "host doesn't need to approve," not "paid." Coupling payment success to that same
+transition for non-instant locations would give `confirmed` two different meanings depending on
+which path produced it. A failed or never-attempted payment also doesn't auto-release the
+booking's reserved interval — a booker can retry payment (a fresh `payments` row against the same
+booking) or the booker/host/admin can cancel the booking through the existing lifecycle action,
+exactly as before payment existed at all. Automatic expiry-driven booking cancellation is a clean,
+isolated later extension (a lazy check against `payments.expires_at`-style bookkeeping on read,
+not a cron job), not built in this phase.
+
+### `public.payments`
+
+One row per **payment attempt** against a booking — a retry after a failed/expired attempt
+creates a new row rather than mutating the old one, preserving the full attempt history.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | generated in application code (`payment.service.ts`), not the DB default — used to derive `provider_order_id` before any provider call is made |
+| `booking_id` | `uuid` | `references bookings(id)`, no cascade (mirrors `bookings.location_id`'s own precedent — bookings are already never hard-deleted anyway) |
+| `provider` | `text` | `check in ('cashfree')` — extended by a later migration when a second provider ships |
+| `provider_order_id` | `text` | the order id **we** generate and send the provider (`pb_<this row's id>`) |
+| `provider_reference_id` | `text`, nullable | the provider's own id for that order/payment (Cashfree's `cf_order_id`/`cf_payment_id`), filled in once known |
+| `status` | `text` | normalized, cross-provider (see below) — never a raw provider status string |
+| `amount_minor_units`, `currency` | `integer`, `text` | copied from `bookings.total_amount_minor_units`/`currency` at creation, never recomputed |
+| `failure_reason` | `text`, nullable | |
+| `provider_raw` | `jsonb`, nullable | last known raw provider response/webhook payload — audit/debug only, **never** serialized into any API response |
+| `created_at`, `updated_at` | `timestamptz` | existing `set_updated_at()` trigger |
+| | | `unique (provider, provider_order_id)`; a **partial** `unique (booking_id) where status in ('created','pending')` — at most one in-flight attempt per booking at a time, the same partial-constraint idiom `bookings`' own `EXCLUDE` and `location_pricing`'s `unique` already established |
+
+### Normalized payment status
+
+`created | pending | success | failed | cancelled | refunded | partially_refunded` — never a raw
+Cashfree status string. Mapping (documented here so a future provider's own mapping has a template
+to follow):
+
+| Cashfree order `order_status` | Normalized |
+|---|---|
+| `ACTIVE` | `pending` |
+| `PAID` | `success` |
+| `EXPIRED` | `failed` |
+| `TERMINATED` / `TERMINATION_REQUESTED` | `cancelled` |
+
+| Cashfree webhook `type` | Normalized event |
+|---|---|
+| `PAYMENT_SUCCESS_WEBHOOK` | `PAYMENT_SUCCESS` |
+| `PAYMENT_FAILED_WEBHOOK` | `PAYMENT_FAILED` |
+| `PAYMENT_USER_DROPPED_WEBHOOK` | `PAYMENT_FAILED` (retryable — a fresh `payments` row can be created for the same booking) |
+| anything else (e.g. `PAYMENT_CHARGES_WEBHOOK`) | acknowledged (`200`), no state change applied |
+
+A payment **never regresses out of a terminal status** (`success`/`failed`/`cancelled`/
+`refunded`/`partially_refunded`) once reached — `payment.service.ts#nextPaymentStatus` is checked
+before every status write, so a delayed/out-of-order webhook (e.g. a late `FAILED` arriving after
+a `SUCCESS`) is always a safe no-op.
+
+### `public.payment_refunds`
+
+One row per refund attempt against a payment. Full vs. partial is just `amount_minor_units`
+relative to the parent payment — there is no refund *policy* engine here (who gets refunded how
+much on a cancellation is a separate, later product decision); this table only represents refund
+*execution*, validated against the arithmetic of what's actually left to refund
+(`payment.amount_minor_units - sum(prior pending/success refunds)`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id`, `payment_id` | `uuid` | `payment_id references payments(id)` |
+| `provider_refund_id` | `text` | merchant-supplied id we send the provider (`pbr_<this row's id>`) |
+| `provider_reference_id` | `text`, nullable | Cashfree's `cf_refund_id` |
+| `status` | `text` | `check in ('pending','success','failed','cancelled')` |
+| `amount_minor_units` | `integer` | `check (> 0)` |
+| `reason`, `provider_raw` | nullable | |
+| | | `unique (payment_id, provider_refund_id)` |
+
+A successful refund recomputes the parent payment's own status: `refunded` once the sum of
+`success` refunds reaches the payment's full amount, `partially_refunded` if it's less.
+
+**Refunds are admin-only in Phase 7** — hosts have no payout/fund-split mechanism yet (see the
+extension point below), so only the platform can currently authorize giving money back.
+
+### `public.payment_webhook_events` — idempotency ledger
+
+Cashfree's webhook payloads don't expose one canonical event-id field the way some providers do,
+so idempotency is keyed on `sha256(raw request body)` instead: `unique (provider, raw_body_hash)`
+catches an exact redelivery (providers redeliver at-least-once) before any business logic runs.
+This is a separate mechanism from the terminal-status guard above — this table stops the *same*
+delivery being processed twice; the terminal-status guard handles a *different*, out-of-order
+delivery arriving late. Internal only: no `authenticated`/`anon` access at all, never exposed
+through any API.
+
+### Raw body & signature verification
+
+Cashfree signs `x-webhook-timestamp + <exact raw request bytes>` with HMAC-SHA256 using the
+client secret, base64-encoded, compared to the `x-webhook-signature` header
+(`CashfreeProvider#verifyAndParseWebhook`, using `crypto.timingSafeEqual` for a constant-time
+comparison). Express's global `express.json()` (mounted in `app.ts`) would parse-and-discard the
+raw buffer before a handler ever saw it — the well-known Stripe-webhook-style ordering gotcha — so
+`POST /v1/payments/webhooks/cashfree` is registered directly on `app`, with
+`express.raw({ type: "application/json" })`, **before** `app.use(express.json())` runs. Every
+other route is unaffected; only that one path receives a raw `Buffer` instead of a parsed body.
+
+### Checkout flow
+
+`POST /v1/bookings/:id/payment` never trusts a client-supplied amount — the request body has no
+amount field at all, and reads `bookings.total_amount_minor_units`/`currency` as the sole source
+of what's charged. The response's `checkout` field is an intentionally opaque, provider-shaped
+payload (`{ payment_session_id, order_id }` for Cashfree, consumed by Cashfree's native
+Checkout SDK client-side) — not a fixed cross-provider contract. The backend remains authoritative
+for whether a payment actually succeeded: `POST /v1/payments/:id/verify` re-checks status directly
+against the provider's own API (never a client's "it succeeded" claim), using the identical
+guarded status-transition logic the webhook handler uses — a webhook and a manual verify can never
+disagree about what "reached success" means.
+
+### RLS
+
+Deliberately different from every other table in this schema: `payments`/`payment_refunds` get a
+`SELECT` policy (booker via a join to `bookings.booker_id = auth.uid()`, host via the same
+`locations.host_id = auth.uid()` join `bookings`' own RLS already uses, or admin) — but **no
+`INSERT`/`UPDATE`/`DELETE` policy for `authenticated` at all**. A row's `status`/`amount_minor_units`
+must never be directly settable by any client call, even a correctly-scoped one — the only truth
+sources are a provider's signed webhook and a server-side status fetch. Every write goes through
+`payment.service.ts` using the `service_role` client, with ownership/authorization checked in
+application code first (the same way `assertLocationManageable` gates every other module's
+writes). This is the first module whose request path genuinely depends on the `service_role`
+client for a live write path — `docs/ARCHITECTURE.md` already names it as reserved for exactly
+this. `payment_webhook_events` has no `authenticated`/`anon` access whatsoever.
+
+### Commission / host earnings / payout — extension point, not built yet
+
+No `platform_fee`/`host_earning`/payout schema was added this phase. `bookings.platform_fee_minor_units`
+(Phase 6, always `0`) remains the gross-amount source; `payments` records actual money movement. A
+later phase can add a `host_payouts` table keyed off both without touching anything documented
+here — this is a structural extension point, not a schema pre-commitment, consistent with not
+building for a requirement that hasn't been asked for yet.
 
 ## Granting the admin role
 

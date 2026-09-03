@@ -12,11 +12,12 @@ overrides, blocked periods, and timezone-aware computed availability), Phase 6 (
 pricing foundation — atomic double-booking prevention, price snapshots, booking lifecycle), and
 Phase 6A (booking model & pricing expansion — four booking types, `hourly`/`half_day`/`day`/
 `multi_day`, each resolving to the same atomically-protected interval, normalized per-type
-`location_pricing`) are done. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
-[`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
-Booking payment is Phase 7 — see
-[`docs/DATABASE.md`](docs/DATABASE.md#booking-engine--pricing-foundation-phase-6-extended-by-phase-6a)
-for the exact extension point.
+`location_pricing`), and Phase 7 (payment architecture — a provider-agnostic `PaymentProvider`
+interface with Cashfree, TEST/sandbox only, as the first implementation) are done. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md), and
+[`docs/API.md`](docs/API.md) for the full picture. Host payouts/commission splitting are the
+next payment-related extension point — see
+[`docs/DATABASE.md`](docs/DATABASE.md#payment-architecture--cashfree-integration-phase-7).
 
 ## Stack
 
@@ -36,6 +37,10 @@ for the exact extension point.
   Postgres/Auth/Studio stack. Without it, migrations and the test suite can't run locally.
 - A **Cloudflare R2** bucket + API token — only needed for a real end-to-end media upload; the
   test suite mocks R2 entirely (see [`docs/DATABASE.md`](docs/DATABASE.md#media-storage-phase-3-cloudflare-r2)).
+- A **Cashfree TEST/sandbox** App ID + Secret Key — only needed for a real end-to-end payment
+  smoke test; the test suite mocks the Cashfree adapter's network calls entirely (webhook
+  signature verification is still tested for real — it's pure local HMAC, no network involved).
+  Production Cashfree credentials are never used in this phase.
 
 ## Quick start
 
@@ -77,8 +82,10 @@ docs/               Architecture, database, and API documentation
 ```
 
 Each `src/modules/<name>` is self-contained (`users`, `roles`, `locations`, `catalog`, `media`,
-`search`, `availability`, `bookings`, `pricing`). Future features (payments, notifications, …)
-are added the same way, as new module folders, without touching existing ones.
+`search`, `availability`, `bookings`, `pricing`, `payments`). Future features (notifications, …)
+are added the same way, as new module folders, without touching existing ones. `payments/providers/`
+holds the provider-agnostic `PaymentProvider` interface plus one adapter per payment provider
+(`CashfreeProvider` today) — see [`docs/DATABASE.md`](docs/DATABASE.md#payment-architecture--cashfree-integration-phase-7).
 
 ## Scripts
 

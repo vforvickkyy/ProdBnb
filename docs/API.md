@@ -645,12 +645,101 @@ Cancelling releases the interval immediately — the same time can be booked aga
 `cancel` request completes, since the exclusion constraint stops considering a cancelled
 booking's interval the moment its status changes.
 
+## Payments (Phase 7 — Cashfree, TEST/sandbox only)
+
+Provider-agnostic by design — see
+[`docs/DATABASE.md`](DATABASE.md#payment-architecture--cashfree-integration-phase-7) for the full
+`PaymentProvider` architecture. Paying for a booking never changes the booking's own `status` —
+see the same doc's "Booking status is not gated on payment" note. A booking's own immutable
+`total_amount_minor_units`/`currency` (Phase 6/6A) is always the amount charged; no endpoint here
+ever accepts a client-supplied amount.
+
+### `POST /v1/bookings/:id/payment`
+
+Requires authentication; only the booking's own booker may call this, and only while its status
+is `requested` or `confirmed`.
+
+Request: `{ "customer_phone": "9876543210", "return_url": "https://..." }` (`customer_phone`
+required — a 10-digit number, Cashfree's own minimum requirement for creating an order;
+`return_url` optional, where a hosted/browser checkout redirects when it completes).
+
+Response (`201`):
+
+```json
+{
+  "data": {
+    "payment_id": "...",
+    "booking_id": "...",
+    "provider": "cashfree",
+    "status": "pending",
+    "amount_minor_units": 25000,
+    "currency": "INR",
+    "checkout": { "payment_session_id": "session_...", "order_id": "pb_..." }
+  }
+}
+```
+
+`checkout` is an intentionally opaque, provider-shaped payload — for Cashfree it's fed directly
+into Cashfree's native Checkout SDK client-side; a future Razorpay integration would return a
+differently-shaped `checkout` object, not this same one.
+
+- `400 VALIDATION_ERROR` — invalid `customer_phone`, an unknown field in the body (e.g. an
+  attempted `amount_minor_units` — the schema is strict, so this is rejected outright, not
+  silently ignored), or the booking isn't in a payable status (`cancelled`/`rejected`/`completed`).
+- `403 FORBIDDEN` — the caller can see the booking (e.g. its host) but isn't its booker.
+- `404 NOT_FOUND` — the booking doesn't exist or isn't visible to the caller at all.
+- `409 CONFLICT` — a payment is already in progress (`created`/`pending`) for this booking; wait
+  for it to resolve or verify it before starting another.
+
+### `GET /v1/bookings/:id/payments`
+
+Requires authentication. RLS-scoped list of every payment *attempt* against a booking (a retry
+after a failed attempt creates a new row, not a new booking) — booker/host/admin see it, anyone
+else gets an empty list.
+
+### `GET /v1/payments/:id`
+
+Requires authentication. RLS-scoped single record; `404` if not visible to the caller.
+
+### `POST /v1/payments/:id/verify`
+
+Requires authentication (booker/host/admin — same visibility as the `GET`). Re-checks status
+directly against Cashfree's own API — never trusts a client's "it succeeded" claim. A no-op
+(returns the current record unchanged) once the payment has already reached a terminal status
+(`success`/`failed`/`cancelled`/`refunded`/`partially_refunded`).
+
+### `POST /v1/payments/:id/refunds`
+
+Requires authentication **and** the `admin` role (hosts have no payout/fund-split mechanism yet —
+see `docs/DATABASE.md`). Request: `{ "amount_minor_units": 5000, "reason": "..." }` — both
+optional; omitting `amount_minor_units` refunds the full remaining (unrefunded) balance.
+
+Response (`201`): the created refund record.
+
+- `400 VALIDATION_ERROR` — the payment never succeeded, or the requested amount exceeds what's
+  actually left to refund.
+- `403 FORBIDDEN` — caller isn't an admin.
+
+### `GET /v1/payments/:id/refunds`
+
+Requires authentication, RLS-scoped list.
+
+### `POST /v1/payments/webhooks/cashfree`
+
+No authentication — Cashfree has no bearer token to send; the webhook's own HMAC-SHA256 signature
+(`x-webhook-timestamp` + `x-webhook-signature` headers, verified against the exact raw request
+body) is the authentication. Not callable meaningfully by anything other than Cashfree itself —
+an invalid or missing signature is rejected before any database write. See
+[`docs/DATABASE.md`](DATABASE.md#raw-body--signature-verification) for the raw-body handling
+detail and the idempotency/out-of-order-safety guarantees.
+
 ## What's intentionally not here yet
 
-Payment (a payment gateway, refunds, host payouts — Phase 7), reviews, messaging, notifications,
-favorites, an admin UI, and availability-aware search are later phases — see the main project
-brief. `GET /v1/locations` (search) still does not filter by availability; a client checks a
-candidate location's availability separately via `GET /v1/locations/:id/availability` and books
-via `POST /v1/bookings`. Booking `status` and payment status are deliberately separate concepts
-— Phase 7 adds its own payment fields to `bookings` without touching booking lifecycle at all.
-Video transcoding, image processing, and AI analysis remain out of scope for the R2 integration.
+Reviews, messaging, notifications, favorites, an admin UI, and availability-aware search are
+later phases — see the main project brief. `GET /v1/locations` (search) still does not filter by
+availability; a client checks a candidate location's availability separately via
+`GET /v1/locations/:id/availability` and books via `POST /v1/bookings`. Host payouts / commission
+splitting are a documented extension point (`docs/DATABASE.md`) but not implemented — Cashfree
+funds currently settle into ProdBnb's own merchant account, refunds are admin-only, and Razorpay
+support is a future provider adapter, not built this phase. Video transcoding, image processing,
+and AI analysis remain out of scope for the R2 integration.

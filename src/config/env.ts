@@ -26,6 +26,24 @@ const envSchema = z.object({
 
   MEDIA_MAX_PHOTO_SIZE_MB: z.coerce.number().int().positive().default(20),
   MEDIA_MAX_VIDEO_SIZE_MB: z.coerce.number().int().positive().default(500),
+
+  // This server's own publicly-reachable base URL — used to build the
+  // webhook notify_url handed to payment providers server-side. Never
+  // influenced by a client request.
+  API_BASE_URL: z.string().url().default("http://localhost:4000"),
+
+  // Which PaymentProvider implementation is active (see
+  // src/modules/payments/providers/index.ts). Only "cashfree" exists so far.
+  PAYMENT_PROVIDER: z.enum(["cashfree"]).default("cashfree"),
+
+  // Cashfree is test/sandbox-only in this phase — deliberately the only
+  // accepted value, so switching to production Cashfree credentials later is
+  // a conscious one-line schema change (adding "production" here plus its
+  // host mapping in CashfreeProvider), never an accidental config typo.
+  CASHFREE_ENV: z.enum(["test"]).default("test"),
+  CASHFREE_APP_ID: z.string().min(1),
+  CASHFREE_SECRET_KEY: z.string().min(1),
+  CASHFREE_API_VERSION: z.string().min(1).default("2023-08-01"),
 });
 
 const parsed = envSchema.safeParse(process.env);

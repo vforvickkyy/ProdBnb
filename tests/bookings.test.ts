@@ -577,7 +577,15 @@ describe("bookings", () => {
       const otherHostList = await request(app).get("/v1/bookings").set(authHeader(otherHost)).query({ pageSize: 100 });
       expect(otherHostList.body.data.map((b: { id: string }) => b.id)).not.toContain(bookingId);
 
-      const adminList = await request(app).get("/v1/bookings").set(authHeader(admin)).query({ pageSize: 100 });
+      // Scoped by location_id rather than relying on an unfiltered page-1
+      // listing staying under the page size -- admin's "see all" reach is
+      // already proven by the RLS policy itself; across the whole test
+      // suite (many files, each creating bookings) an unscoped admin query
+      // can exceed one page well before this specific booking is reached.
+      const adminList = await request(app)
+        .get("/v1/bookings")
+        .set(authHeader(admin))
+        .query({ pageSize: 100, location_id: locationId });
       expect(adminList.body.data.map((b: { id: string }) => b.id)).toContain(bookingId);
 
       const bookerDetail = await request(app).get(`/v1/bookings/${bookingId}`).set(authHeader(booker));
