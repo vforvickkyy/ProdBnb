@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { writeAuditLog } from "../admin/audit.service";
 import { callerHasRole } from "../../middleware/requireRole";
 import { created, ok } from "../../utils/respond";
 import { BookingIdParam } from "../bookings/bookings.schema";
@@ -47,6 +48,14 @@ export async function postRefund(req: Request, res: Response): Promise<void> {
   const input = req.valid!.body as CreateRefundInput;
   const isAdmin = await isCallerAdmin(req);
   const refund = await createRefund(isAdmin, id, input);
+  // createRefund() already requires isAdmin unconditionally, so every
+  // successful call through this route is an admin action -- audited
+  // identically to the dedicated POST /v1/admin/payments/:id/refunds (Phase
+  // 11), so using the older route doesn't produce a silent, unaudited refund
+  // (Phase 12).
+  await writeAuditLog(req.user!.id, "ADMIN_CREATED_REFUND", "payment", id, input.reason ?? null, {
+    amount_minor_units: refund.amount_minor_units,
+  });
   created(res, refund);
 }
 

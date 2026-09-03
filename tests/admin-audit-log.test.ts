@@ -21,6 +21,27 @@ async function grantAdmin(user: TestUser): Promise<void> {
   if (error) throw error;
 }
 
+async function publish(locationId: string): Promise<void> {
+  const { error } = await adminClient.from("locations").update({ status: "published" }).eq("id", locationId);
+  if (error) throw error;
+}
+
+async function addRule(locationId: string, owner: TestUser, day: string, start: string, end: string): Promise<void> {
+  const res = await request(app)
+    .post(`/v1/locations/${locationId}/availability/rules`)
+    .set(authHeader(owner))
+    .send({ day_of_week: day, start_time: start, end_time: end });
+  expect(res.status).toBe(201);
+}
+
+async function addHourlyPricing(locationId: string, owner: TestUser, amount = 10_000): Promise<void> {
+  const res = await request(app)
+    .post(`/v1/locations/${locationId}/pricing`)
+    .set(authHeader(owner))
+    .send({ booking_type: "hourly", amount_minor_units: amount });
+  expect(res.status).toBe(201);
+}
+
 describe("admin: audit log", () => {
   let admin: TestUser;
   let booker: TestUser;
@@ -110,5 +131,86 @@ describe("admin: audit log", () => {
   it("rejects an unauthenticated caller", async () => {
     const res = await request(app).get("/v1/admin/audit-log");
     expect(res.status).toBe(401);
+  });
+
+  // Phase 12: an admin using the older, pre-Phase-11 routes (which already
+  // accepted the same admin-bypass) used to leave zero audit trail -- only
+  // the dedicated /v1/admin/* wrappers logged. These prove both legacy paths
+  // are now covered too.
+
+  it("POST /v1/bookings/:id/cancel used by an admin audits ADMIN_CANCELLED_BOOKING, same as the dedicated admin route", async () => {
+    const otherBooker = await createTestUser();
+    const otherHost = await createTestUser();
+    try {
+      await grantRole(otherBooker, "booker");
+      await grantRole(otherHost, "host");
+
+      const locRes = await request(app)
+        .post("/v1/locations")
+        .set(authHeader(otherHost))
+        .send({ title: "Legacy Cancel Audit Test", city: "London", country: "UK", timezone: "UTC" });
+      expect(locRes.status).toBe(201);
+      const locationId = locRes.body.data.id as string;
+      await addRule(locationId, otherHost, "monday", "09:00", "18:00");
+      await addHourlyPricing(locationId, otherHost);
+      await publish(locationId);
+
+      const bookingRes = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(otherBooker))
+        .send({ location_id: locationId, booking_type: "hourly", start_at: "2026-10-05T09:00:00Z", end_at: "2026-10-05T10:00:00Z" });
+      expect(bookingRes.status).toBe(201);
+      const bookingId = bookingRes.body.data.id as string;
+
+      // The generic, pre-Phase-11 route -- not /v1/admin/bookings/:id/cancel.
+      const cancelRes = await request(app)
+        .post(`/v1/bookings/${bookingId}/cancel`)
+        .set(authHeader(admin))
+        .send({ reason: "Legacy-route admin cancel." });
+      expect(cancelRes.status).toBe(200);
+
+      const { data: entry, error } = await adminClient
+        .from("admin_audit_log")
+        .select("action, admin_id, target_id, reason")
+        .eq("target_type", "booking")
+        .eq("target_id", bookingId)
+        .single();
+      if (error) throw error;
+      expect(entry.action).toBe("ADMIN_CANCELLED_BOOKING");
+      expect(entry.admin_id).toBe(admin.id);
+      expect(entry.reason).toBe("Legacy-route admin cancel.");
+    } finally {
+      await deleteTestUser(otherBooker.id);
+      await deleteTestUser(otherHost.id);
+    }
+  });
+
+  it("PATCH /v1/locations/:id used by an admin to change status audits ADMIN_UPDATED_LOCATION_STATUS", async () => {
+    const otherHost = await createTestUser();
+    try {
+      await grantRole(otherHost, "host");
+      const locRes = await request(app)
+        .post("/v1/locations")
+        .set(authHeader(otherHost))
+        .send({ title: "Legacy PATCH Audit Test", city: "London", country: "UK" });
+      expect(locRes.status).toBe(201);
+      const locationId = locRes.body.data.id as string;
+
+      const patchRes = await request(app).patch(`/v1/locations/${locationId}`).set(authHeader(admin)).send({ status: "approved" });
+      expect(patchRes.status).toBe(200);
+
+      const { data: entry, error } = await adminClient
+        .from("admin_audit_log")
+        .select("action, admin_id, target_id, metadata")
+        .eq("target_type", "location")
+        .eq("target_id", locationId)
+        .single();
+      if (error) throw error;
+      expect(entry.action).toBe("ADMIN_UPDATED_LOCATION_STATUS");
+      expect(entry.admin_id).toBe(admin.id);
+      expect(entry.metadata).toMatchObject({ previous_status: "draft", new_status: "approved" });
+    } finally {
+      await deleteTestUser(otherHost.id);
+    }
   });
 });

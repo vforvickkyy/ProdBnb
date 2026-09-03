@@ -3,6 +3,7 @@ import { SupabaseClient } from "@supabase/supabase-js";
 import { env } from "../../config/env";
 import { NotFoundError, ValidationError } from "../../errors/AppError";
 import { deleteObject, headObject, objectKeyFor, presignUpload } from "../../lib/r2";
+import { adminClient } from "../../lib/supabase";
 import {
   assertLocationManageable,
   getVisibleLocationOrNull,
@@ -114,7 +115,13 @@ export async function completeUpload(
 
   const resolvedPosition = position ?? (await nextPosition(supabase, locationId));
 
-  const { data, error } = await supabase
+  // adminClient, not the caller's own scoped client (Phase 12: `location_media`
+  // no longer grants authenticated INSERT at all) -- otherwise a host could
+  // bypass the headObject() verification above entirely via direct PostgREST
+  // and register a row pointing at any storage_key, including another
+  // location's real, already-uploaded media. Ownership was already fully
+  // checked by assertCanManageLocation() above.
+  const { data, error } = await adminClient
     .from("location_media")
     .insert({
       id: mediaId,

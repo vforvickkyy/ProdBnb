@@ -1,5 +1,6 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
+import { adminClient } from "../../lib/supabase";
 import { getVisibleLocationOrNull } from "../locations/locations.service";
 import {
   notifyBookingCancelled,
@@ -213,7 +214,14 @@ export async function createBooking(
   );
   const status = location.instant_booking_enabled ? "confirmed" : "requested";
 
-  const { data, error } = await supabase
+  // Every authorization/business-rule check above already ran against the
+  // caller's own scoped client (location visibility, availability, pricing)
+  // -- the actual insert uses adminClient because `bookings` no longer grants
+  // authenticated INSERT at all (Phase 12: a client could otherwise bypass
+  // this function entirely via direct PostgREST and fabricate an arbitrary
+  // price/status/interval). This does not change WHO may create a booking,
+  // only WHERE the write executes from.
+  const { data, error } = await adminClient
     .from("bookings")
     .insert({
       location_id: input.location_id,
@@ -340,22 +348,32 @@ async function loadBookingAccess(supabase: SupabaseClient, callerId: string, boo
   return { row: data, isBooker, isHost };
 }
 
+// Writes via adminClient (Phase 12: `bookings` no longer grants authenticated
+// UPDATE at all, for the same reason createBooking's insert moved -- a client
+// could otherwise PATCH its own booking's price/status directly). The
+// `expectedStatus` compare-and-swap guard is a separate, smaller fix: without
+// it, two concurrent transitions on the same booking (e.g. a host reject
+// racing an admin confirm) could both pass their earlier status check and
+// then both silently apply, with contradictory notifications firing for
+// each. Every caller already knows the status it validated against, from the
+// loadBookingAccess() read immediately before calling this.
 async function transitionBooking(
-  supabase: SupabaseClient,
   bookingId: string,
+  expectedStatus: string,
   patch: Record<string, unknown>
 ): Promise<BookingDetail> {
-  const { data, error } = await supabase
+  const { data, error } = await adminClient
     .from("bookings")
     .update(patch)
     .eq("id", bookingId)
+    .eq("status", expectedStatus)
     .select(BOOKING_DETAIL_SELECT)
     .maybeSingle();
   if (error) {
     throw error;
   }
   if (!data) {
-    throw new NotFoundError("Booking not found.");
+    throw new ConflictError("This booking's status just changed -- please refresh and try again.");
   }
   return toBookingDetail(data as unknown as RawBookingRow);
 }
@@ -373,7 +391,7 @@ export async function confirmBooking(
   if (row.status !== "requested") {
     throw new ValidationError(`Cannot confirm a booking with status '${row.status}'.`);
   }
-  const booking = await transitionBooking(supabase, bookingId, { status: "confirmed" });
+  const booking = await transitionBooking(bookingId, row.status, { status: "confirmed" });
   await notifyBookingConfirmed(booking.booker_id, booking.id);
   return booking;
 }
@@ -392,7 +410,7 @@ export async function rejectBooking(
   if (row.status !== "requested") {
     throw new ValidationError(`Cannot reject a booking with status '${row.status}'.`);
   }
-  const booking = await transitionBooking(supabase, bookingId, {
+  const booking = await transitionBooking(bookingId, row.status, {
     status: "rejected",
     cancellation_reason: input.reason ?? null,
   });
@@ -413,7 +431,7 @@ export async function completeBooking(
   if (row.status !== "confirmed") {
     throw new ValidationError(`Cannot complete a booking with status '${row.status}'.`);
   }
-  return transitionBooking(supabase, bookingId, { status: "completed" });
+  return transitionBooking(bookingId, row.status, { status: "completed" });
 }
 
 export async function cancelBooking(
@@ -430,7 +448,7 @@ export async function cancelBooking(
   if (row.status !== "requested" && row.status !== "confirmed") {
     throw new ValidationError(`Cannot cancel a booking with status '${row.status}'.`);
   }
-  const booking = await transitionBooking(supabase, bookingId, {
+  const booking = await transitionBooking(bookingId, row.status, {
     status: "cancelled",
     cancelled_at: new Date().toISOString(),
     cancelled_by: callerId,

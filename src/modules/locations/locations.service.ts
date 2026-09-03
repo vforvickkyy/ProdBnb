@@ -1,6 +1,8 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
+import { adminClient } from "../../lib/supabase";
 import { publicUrlFor } from "../../lib/r2";
+import { writeAuditLog } from "../admin/audit.service";
 import { CreateLocationInput, UpdateLocationInput } from "./locations.schema";
 
 const FOREIGN_KEY_VIOLATION = "23503";
@@ -356,12 +358,37 @@ export async function updateLocation(
     }
   }
 
-  const patch = { ...fields, ...(status !== undefined ? { status } : {}) };
-
-  if (Object.keys(patch).length > 0) {
-    const { error } = await supabase.from("locations").update(patch).eq("id", locationId);
+  // `locations` no longer grants authenticated UPDATE on status at all
+  // (Phase 12: a host could otherwise self-publish or self-restore via
+  // direct PostgREST, bypassing HOST_ALLOWED_TRANSITIONS/admin moderation
+  // entirely). Ordinary content fields are unaffected -- host-owns-row is
+  // still fully enforced above, and via RLS -- only status now requires the
+  // service-role client. Two separate statements because a single UPDATE
+  // naming any column the caller's own client isn't granted would fail in
+  // full, even for the columns it IS allowed to touch.
+  if (Object.keys(fields).length > 0) {
+    const { error } = await supabase.from("locations").update(fields).eq("id", locationId);
     if (error) {
       throw error;
+    }
+  }
+
+  if (status !== undefined) {
+    const { error } = await adminClient.from("locations").update({ status }).eq("id", locationId);
+    if (error) {
+      throw error;
+    }
+    if (isAdmin) {
+      // Only the four purpose-built moderation actions (approve/reject/
+      // suspend/restore, admin/locations.service.ts) map cleanly onto their
+      // own documented audit action -- this generic path can reach ANY of
+      // the 8 statuses (including 'approved'/'under_review', which no
+      // dedicated endpoint produces), so it gets its own, equally-audited
+      // action rather than being force-fit into one of the other four.
+      await writeAuditLog(callerId, "ADMIN_UPDATED_LOCATION_STATUS", "location", locationId, null, {
+        previous_status: current.status,
+        new_status: status,
+      });
     }
   }
 

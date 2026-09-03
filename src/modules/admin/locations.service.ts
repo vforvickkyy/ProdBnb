@@ -1,14 +1,16 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { NotFoundError, ValidationError } from "../../errors/AppError";
+import { adminClient } from "../../lib/supabase";
 import { getLocation, getVisibleLocationOrNull, LocationDetail } from "../locations/locations.service";
 import { writeAuditLog } from "./audit.service";
 
-// All reads/writes here use the caller's own request-scoped client, never
-// adminClient -- `locations_update_own_or_admin` and
-// `profiles_select_own_or_admin` (both pre-existing RLS policies) already
-// let an admin's own scoped client see/update any row, exactly the same way
-// the generic PATCH /v1/locations/:id admin path already worked before this
-// phase. No new RLS bypass is needed for moderation.
+// Reads use the caller's own request-scoped client (RLS already lets an
+// admin's own scoped client see any row). Writes use adminClient (Phase 12:
+// `locations` no longer grants authenticated UPDATE on status/
+// moderation_reason/suspended_by_host_suspension at all, precisely so a
+// caller can't reach these columns via direct PostgREST -- these four
+// functions are now the only place, alongside the generic-PATCH admin path
+// in locations.service.ts, that can ever move them).
 
 async function isHostSuspended(supabase: SupabaseClient, hostId: string): Promise<boolean> {
   const { data, error } = await supabase.from("profiles").select("status").eq("id", hostId).maybeSingle();
@@ -18,8 +20,8 @@ async function isHostSuspended(supabase: SupabaseClient, hostId: string): Promis
   return data?.status === "suspended";
 }
 
-async function updateLocationRow(supabase: SupabaseClient, locationId: string, patch: Record<string, unknown>): Promise<void> {
-  const { error } = await supabase.from("locations").update(patch).eq("id", locationId);
+async function updateLocationRow(locationId: string, patch: Record<string, unknown>): Promise<void> {
+  const { error } = await adminClient.from("locations").update(patch).eq("id", locationId);
   if (error) {
     throw error;
   }
@@ -41,7 +43,7 @@ export async function approveLocation(supabase: SupabaseClient, adminId: string,
     throw new ValidationError("Cannot approve a location whose host is currently suspended.");
   }
 
-  await updateLocationRow(supabase, locationId, { status: "published", moderation_reason: null });
+  await updateLocationRow(locationId, { status: "published", moderation_reason: null });
   await writeAuditLog(adminId, "ADMIN_APPROVED_LOCATION", "location", locationId, null, { previous_status: location.status });
   return getLocation(supabase, locationId);
 }
@@ -60,7 +62,7 @@ export async function rejectLocation(
     throw new ValidationError(`Cannot reject a location with status '${location.status}'.`);
   }
 
-  await updateLocationRow(supabase, locationId, { status: "rejected", moderation_reason: reason });
+  await updateLocationRow(locationId, { status: "rejected", moderation_reason: reason });
   await writeAuditLog(adminId, "ADMIN_REJECTED_LOCATION", "location", locationId, reason, { previous_status: location.status });
   return getLocation(supabase, locationId);
 }
@@ -80,7 +82,7 @@ export async function suspendLocation(
     throw new ValidationError(`Cannot suspend a location with status '${location.status}'.`);
   }
 
-  await updateLocationRow(supabase, locationId, {
+  await updateLocationRow(locationId, {
     status: "suspended",
     moderation_reason: reason,
     suspended_by_host_suspension: false,
@@ -99,7 +101,7 @@ export async function restoreLocation(supabase: SupabaseClient, adminId: string,
     throw new ValidationError(`Cannot restore a location with status '${location.status}'.`);
   }
 
-  await updateLocationRow(supabase, locationId, {
+  await updateLocationRow(locationId, {
     status: "published",
     moderation_reason: null,
     suspended_by_host_suspension: false,

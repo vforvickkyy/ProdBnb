@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { writeAuditLog } from "../admin/audit.service";
 import { callerHasRole } from "../../middleware/requireRole";
 import { created, ok } from "../../utils/respond";
 import {
@@ -54,6 +55,13 @@ export async function postCancelBooking(req: Request, res: Response): Promise<vo
   const input = req.valid!.body as BookingActionInput;
   const isAdmin = await isCallerAdmin(req);
   const booking = await cancelBooking(req.supabase!, req.user!.id, isAdmin, id, input);
+  // This route accepts the same admin-cancel capability as the dedicated
+  // POST /v1/admin/bookings/:id/cancel (Phase 11) -- audited identically
+  // here so an admin can't get a silent, unaudited cancellation just by
+  // using the older route instead of the newer one (Phase 12).
+  if (isAdmin) {
+    await writeAuditLog(req.user!.id, "ADMIN_CANCELLED_BOOKING", "booking", id, input.reason ?? null, {});
+  }
   ok(res, booking);
 }
 

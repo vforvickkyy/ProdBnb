@@ -223,6 +223,35 @@ describe("payments", () => {
       expect(second.status).toBe(409);
     });
 
+    it("rejects a new payment once the booking already has a successful one (Phase 12: no accumulating duplicate charges)", async () => {
+      const locationId = await createBookableLocation(host);
+      const booking = await createBooking(booker, locationId);
+
+      const first = await request(app)
+        .post(`/v1/bookings/${booking.id}/payment`)
+        .set(authHeader(booker))
+        .send({ customer_phone: "9876543210" });
+      expect(first.status).toBe(201);
+      const providerOrderId = first.body.data.checkout.order_id as string;
+      mockState.orderStatus.set(providerOrderId, "success");
+      const verify = await request(app).post(`/v1/payments/${first.body.data.payment_id}/verify`).set(authHeader(booker));
+      expect(verify.body.data.status).toBe("success");
+
+      // Booking status is deliberately untouched by payment success (Phase
+      // 7) -- still requested/confirmed, so nothing else would stop a second
+      // POST here except the Phase 12 guard itself.
+      const second = await request(app)
+        .post(`/v1/bookings/${booking.id}/payment`)
+        .set(authHeader(booker))
+        .send({ customer_phone: "9876543210" });
+      expect(second.status).toBe(409);
+
+      const { data: payments, error } = await adminClient.from("payments").select("id, status").eq("booking_id", booking.id);
+      if (error) throw error;
+      expect(payments).toHaveLength(1);
+      expect(payments![0]!.status).toBe("success");
+    });
+
     it("marks the payment failed (not silently pending forever) if the provider call itself errors", async () => {
       const locationId = await createBookableLocation(host);
       const booking = await createBooking(booker, locationId);
@@ -431,6 +460,28 @@ describe("payments", () => {
         .send({ customer_phone: "9876543210" });
       const res = await request(app).post(`/v1/payments/${create.body.data.payment_id}/refunds`).set(authHeader(admin)).send({});
       expect(res.status).toBe(400);
+    });
+
+    it("Phase 12: this same (pre-Phase-11) route writes an ADMIN_CREATED_REFUND audit entry, same as the dedicated admin route", async () => {
+      mockState.refundStatus = "success";
+      const { paymentId, amount } = await createSucceededPayment();
+      const res = await request(app)
+        .post(`/v1/payments/${paymentId}/refunds`)
+        .set(authHeader(admin))
+        .send({ reason: "Legacy-route refund audit test." });
+      expect(res.status).toBe(201);
+
+      const { data: entry, error } = await adminClient
+        .from("admin_audit_log")
+        .select("action, admin_id, target_id, reason, metadata")
+        .eq("target_type", "payment")
+        .eq("target_id", paymentId)
+        .single();
+      if (error) throw error;
+      expect(entry.action).toBe("ADMIN_CREATED_REFUND");
+      expect(entry.admin_id).toBe(admin.id);
+      expect(entry.reason).toBe("Legacy-route refund audit test.");
+      expect(entry.metadata).toMatchObject({ amount_minor_units: amount });
     });
   });
 

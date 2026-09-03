@@ -144,6 +144,26 @@ export async function createPayment(
     throw new ConflictError("A payment is already in progress for this booking.");
   }
 
+  // Payment success deliberately never mutates booking status (Phase 7), so
+  // a booking stays requested/confirmed indefinitely after being paid --
+  // without this check, nothing stops the same booker from calling this
+  // endpoint again and paying a second time in full. `payments_one_settled_
+  // per_booking` (Phase 12 migration) is the atomic DB-level backstop against
+  // the same race this in-flight check already has via
+  // payments_one_inflight_per_booking.
+  const { data: alreadySettled, error: alreadySettledError } = await adminClient
+    .from("payments")
+    .select("id")
+    .eq("booking_id", bookingId)
+    .in("status", ["success", "partially_refunded", "refunded"])
+    .maybeSingle();
+  if (alreadySettledError) {
+    throw alreadySettledError;
+  }
+  if (alreadySettled) {
+    throw new ConflictError("This booking has already been paid for.");
+  }
+
   const paymentId = randomUUID();
   const providerOrderId = `pb_${paymentId.replace(/-/g, "")}`;
   const provider = getPaymentProvider();
@@ -158,11 +178,12 @@ export async function createPayment(
     currency: booking.pricing.currency,
   });
   if (insertError) {
-    // The partial unique index (payments_one_inflight_per_booking) is the
-    // real backstop against a double-submit race -- the pre-check above is
-    // just for a clean error message in the common case.
+    // The partial unique indexes (payments_one_inflight_per_booking,
+    // payments_one_settled_per_booking) are the real backstops against a
+    // double-submit race -- the pre-checks above are just for a clean error
+    // message in the common (non-racing) case.
     if (insertError.code === UNIQUE_VIOLATION) {
-      throw new ConflictError("A payment is already in progress for this booking.");
+      throw new ConflictError("A payment is already in progress or has already been completed for this booking.");
     }
     throw insertError;
   }

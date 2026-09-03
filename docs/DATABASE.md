@@ -229,10 +229,12 @@ table's migration statements include the grants from the start.
   auth.uid()`), or the caller is admin. To `anon` and `authenticated`.
 - **`locations` INSERT** — only a caller holding the `host` role, and only for themself
   (`host_id = auth.uid() and has_role(auth.uid(),'host')`).
-- **`locations` UPDATE/DELETE** — owner or admin. The app layer additionally excludes `host_id`
-  from the update schema entirely (same defense-in-depth idiom as Phase 1 excluding `status`
-  from the profile update schema) and enforces the status-transition rule above — RLS alone
-  doesn't know about the transition allow-list.
+- **`locations` UPDATE/DELETE** — owner or admin. **As of Phase 12**, `authenticated`'s column
+  grant on `UPDATE` (and `INSERT`) excludes `status`/`moderation_reason`/
+  `suspended_by_host_suspension`/`host_id` entirely — a raw PostgREST call can no longer move
+  status regardless of ownership; only the service-role-backed code paths in
+  `locations.service.ts`/`admin/locations.service.ts` can. See "RLS/grant hardening (Phase 12)"
+  below for why and what changed.
 - **`location_categories`/`location_amenities`/`location_use_cases` SELECT** — mirrors the
   parent location's own visibility. **INSERT/DELETE** — requires owning the parent location (or
   admin); no separate role check needed, since ownership already implies the row's creator was
@@ -1158,7 +1160,7 @@ trigger, never mutated after insert.
 |---|---|---|
 | `id` | `uuid` PK | |
 | `admin_id` | `uuid` | `references profiles(id)` |
-| `action` | `text` | `check in (...)` — a closed set matching exactly the 8 mutating admin actions this phase implements: `ADMIN_APPROVED_LOCATION`, `ADMIN_REJECTED_LOCATION`, `ADMIN_SUSPENDED_LOCATION`, `ADMIN_RESTORED_LOCATION`, `ADMIN_SUSPENDED_USER`, `ADMIN_RESTORED_USER`, `ADMIN_CANCELLED_BOOKING`, `ADMIN_CREATED_REFUND` |
+| `action` | `text` | `check in (...)` — a closed set matching exactly the 8 mutating admin actions this phase implements: `ADMIN_APPROVED_LOCATION`, `ADMIN_REJECTED_LOCATION`, `ADMIN_SUSPENDED_LOCATION`, `ADMIN_RESTORED_LOCATION`, `ADMIN_SUSPENDED_USER`, `ADMIN_RESTORED_USER`, `ADMIN_CANCELLED_BOOKING`, `ADMIN_CREATED_REFUND` (extended to 9 actions in Phase 12 — see "RLS/grant hardening (Phase 12)" below) |
 | `target_type` | `text` | `check in ('location','user','booking','payment')` |
 | `target_id` | `uuid` | |
 | `reason`, `metadata` | nullable / `jsonb` | |
@@ -1266,6 +1268,111 @@ the other ~50 existing endpoints from Phases 1–8; scoped to the admin surface 
 the one with a new, separate frontend consumer that benefits from generated types. The Admin
 Panel project generates its own TypeScript request/response types from this document rather than
 hand-copying shapes between the two repositories.
+
+## RLS/grant hardening (Phase 12)
+
+A security audit found that `bookings`, `locations`, and `location_media` shared a gap: RLS
+checked row *ownership* only ("is this your row"), never *which columns* or *values* a write
+could touch. `profiles.status` (Phase 1) and `payments`/`payment_refunds` (Phase 7) already got
+this right — this phase extends the same pattern to the three tables that were missed. No booking/
+pricing/payment/notification/location-lifecycle architecture changed; every fix is a grant
+restriction plus routing the affected write through `adminClient` from the same service function
+that already fully enforced authorization in application code (nothing about *who* may perform an
+action changed, only *where* the write executes from).
+
+**`bookings`** — `authenticated` now has **`SELECT` only**; `INSERT`/`UPDATE` are revoked
+entirely. Every write goes through `adminClient` from `bookings.service.ts` (`createBooking()`,
+`transitionBooking()`), exactly mirroring how `payments` has worked since Phase 7. Before this,
+a booker holding a real Supabase session (every legitimate client already has one) could
+`PATCH .../rest/v1/bookings?id=eq.<own booking>` directly and rewrite their own booking's
+`total_amount_minor_units` to near-zero before paying for it — the "immutable price snapshot"
+`payment.service.ts#createPayment` trusts was never actually immutable at the database layer. The
+same gap let a booker self-set `status` to `confirmed` (skipping host approval) or insert a
+fabricated `completed` booking directly, which sits outside the EXCLUDE constraint's guarded-status
+set (`requested`/`confirmed` only) and so evaded the double-booking guarantee entirely. Verified
+closed in `tests/hardening.test.ts` via real PostgREST calls with a real booker session, not just
+API-level assertions.
+
+**`locations`** — `authenticated` keeps `INSERT`/`UPDATE`, but the column grant excludes `status`,
+`moderation_reason`, `suspended_by_host_suspension`, and `host_id`. A host's own content edits
+(title/description/address/...) are unaffected — still a single statement via their own scoped
+client. Any write touching `status` — a host's own `draft→submitted`/`submitted→draft`/
+`published→archived`, or an admin's moderation/override — now goes through `adminClient` from
+`updateLocation()` (`locations.service.ts`) or the four dedicated moderation functions
+(`admin/locations.service.ts`, which previously used the caller's own scoped client for this and
+had to switch). `createLocation()`'s `INSERT` never included `status` to begin with (it always
+takes the column default, `'draft'`) — the same column exclusion now makes that true even for a
+raw PostgREST insert, not just the app's own schema. Before this, a host could self-publish a
+draft directly via PostgREST, bypassing admin moderation entirely, or self-clear
+`moderation_reason`/restore a location an admin had suspended.
+
+**`location_media`** — `authenticated` loses `INSERT` entirely (kept: `UPDATE (position)` for
+reordering, and `DELETE`, both already ownership-gated and unaffected). Only
+`completeUpload()` (`media.service.ts`) may create a row now, via `adminClient`, and only after
+its existing `headObject()` verification against the real uploaded R2 object. Before this, a host
+could insert a `location_media` row directly, pointing `storage_key` at any string — including
+another location's real, already-uploaded object (its key is derivable from that location's own
+public media URLs) — bypassing the content-type/size verification `completeUpload()` performs and
+effectively "stealing" another host's media into their own listing.
+
+**New audit action: `ADMIN_UPDATED_LOCATION_STATUS`.** The generic `PATCH /v1/locations/:id`
+retains its existing admin capability to set *any* of the 8 statuses (unlike the four dedicated
+moderation actions, this path can reach `approved`/`under_review`, which no dedicated endpoint
+produces) — now routed through `adminClient` like everything else above, and audited under this
+new action (`previous_status`/`new_status` in `metadata`) so it's no longer a silent, unaudited
+path. `admin_audit_log.action`'s `CHECK` constraint was extended (looked up and dropped
+dynamically in the migration, rather than hardcoding Postgres's auto-generated constraint name) to
+add it — the set is now 9 actions, not 8.
+
+**Two other pre-existing routes also used to leave zero audit trail when an admin used them**:
+the generic `POST /v1/bookings/:id/cancel` and `POST /v1/payments/:id/refunds` (both predate
+Phase 11 and already accepted an admin-bypass caller) never called `writeAuditLog` — only the
+dedicated `/v1/admin/bookings/:id/cancel` / `/v1/admin/payments/:id/refunds` wrappers did. Both
+legacy routes now log the same `ADMIN_CANCELLED_BOOKING`/`ADMIN_CREATED_REFUND` actions their
+dedicated counterparts already used, so which route an admin happens to call no longer determines
+whether the action is auditable. Verified in `tests/admin-audit-log.test.ts` and
+`tests/payments.test.ts`.
+
+**Two new DB-level backstops**, both mirroring `payments_one_inflight_per_booking`'s existing
+"atomic backstop under an application-level pre-check" shape:
+
+- `payments_one_settled_per_booking` — a partial unique index on `payments (booking_id) where
+  status in ('success','partially_refunded','refunded')`. `createPayment()` already rejects a
+  second payment attempt once one has succeeded (payment success deliberately never mutates
+  booking status, so nothing else stopped a retried `POST .../payment` from creating a second,
+  fully separate, fully charged payment) — this index makes that guarantee atomic under a genuine
+  concurrent double-submit, the same relationship the existing in-flight index already has to its
+  own pre-check.
+- `enforce_refund_balance()` — a `BEFORE INSERT` trigger on `payment_refunds` that locks the
+  parent `payments` row (`SELECT ... FOR UPDATE`) and re-validates the exact balance rule
+  `createRefund()` already applies (sum of `pending`+`success` prior refunds plus the new one must
+  not exceed the payment's amount) before allowing the insert. Closes a TOCTOU race the
+  application's own check-then-insert couldn't close on its own: two concurrent refund requests
+  against the same payment could otherwise both read the same "remaining balance" before either
+  committed.
+
+**Four new indexes** for query patterns that already existed in the service layer but had no
+matching index: `bookings (location_id, start_at desc)` and `bookings (status, start_at desc)`
+(the existing partial GiST EXCLUDE index only covers active-status *overlap* checks, not plain
+listing/filtering across all statuses — `listBookings()`/`GET /v1/admin/bookings` needed these);
+`payments (status, created_at desc)` and `payment_refunds (status, created_at desc)` (the admin
+payments/refunds dashboard filters and sorts on exactly these columns).
+
+**`optionalAuth`** (`src/middleware/optionalAuth.ts`) now checks `profiles.status` too, matching
+`requireAuth` — a suspended/deleted caller's token now falls back to anonymous (never a rejection,
+matching this middleware's existing behavior for an invalid/expired token) instead of retaining
+owner-level visibility on the four `optionalAuth`-gated read routes (`GET /v1/locations/:id`,
+`/media`, `/pricing`, `/availability`).
+
+**`transitionBooking()`** (`bookings.service.ts`) gained a compare-and-swap guard — its `UPDATE`
+now also matches on the exact status each caller (`confirmBooking`/`rejectBooking`/
+`completeBooking`/`cancelBooking`) already validated against, returning a clean `409` instead of
+silently applying if two concurrent transitions race on the same booking (e.g. a host reject
+racing an admin confirm). Doesn't affect the double-booking guarantee (no transition here changes
+the reserved interval) — it closes a smaller, separate lifecycle race that could otherwise fire
+two contradictory notifications for the same booking. Verified with a genuine `Promise.all`
+concurrency test in `tests/hardening.test.ts`, matching the existing shape of the booking-creation
+concurrency tests.
 
 ## Granting the admin role
 

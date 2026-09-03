@@ -16,10 +16,15 @@ Phase 6A (booking model & pricing expansion — four booking types, `hourly`/`ha
 interface with Cashfree, TEST/sandbox only, as the first implementation), and Phase 8
 (notification infrastructure — in-app notifications, multi-device push registration, preferences,
 and a provider-agnostic `NotificationProvider` interface with APNs as the first implementation),
-and Phase 11 (admin control — a `/v1/admin/*` API namespace for user/host/location moderation,
+Phase 11 (admin control — a `/v1/admin/*` API namespace for user/host/location moderation,
 booking/payment/refund oversight, and an immutable audit log, backing a separate Admin Panel
-frontend project) are done. Phases 9 (Favorites + Reviews) and 10 (Messaging/Chat) are
-intentionally skipped for now. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+frontend project), and Phase 12 (security + performance hardening audit — closed a
+column/grant-level RLS gap shared by `bookings`/`locations`/`location_media`, two payment/refund
+TOCTOU races, and an admin audit-log completeness gap on two pre-Phase-11 routes; added four
+indexes for existing admin/host listing query patterns; see
+[`docs/DATABASE.md`](docs/DATABASE.md#rlsgrant-hardening-phase-12)) are done. Phases 9 (Favorites +
+Reviews) and 10 (Messaging/Chat) are intentionally skipped for now. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
 **The notification system is fully developed and tested without any Apple Developer account or
 APNs credentials** — it defaults to an explicit `disabled` provider that records every push

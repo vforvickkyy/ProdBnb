@@ -863,9 +863,15 @@ or `?booking_id=` (one required) — `status`/`provider`/`error_reason`/timestam
 attempt only. Never returns another user's notification title/body/content.
 
 **Audit log** — `GET /v1/admin/audit-log?target_type=&target_id=&admin_id=&page=&pageSize=`. Every
-one of the 8 mutating admin actions above writes exactly one entry as its last step; there is no
-endpoint to create, edit, or delete an entry directly — see `docs/DATABASE.md` for why that's
-structurally impossible, not just unimplemented.
+mutating admin action writes exactly one entry as its last step; there is no endpoint to create,
+edit, or delete an entry directly — see `docs/DATABASE.md` for why that's structurally impossible,
+not just unimplemented. **Phase 12**: the generic (pre-Phase-11) `PATCH /v1/locations/:id`,
+`POST /v1/bookings/:id/cancel`, and `POST /v1/payments/:id/refunds` also accept an admin caller —
+using one of these instead of its `/v1/admin/*` counterpart now audits identically (a new
+`ADMIN_UPDATED_LOCATION_STATUS` action for the generic location PATCH, since it can reach statuses
+none of the four dedicated moderation actions produce; the existing `ADMIN_CANCELLED_BOOKING`/
+`ADMIN_CREATED_REFUND` actions for the other two) — nothing privileged is reachable through any
+route without leaving a trail.
 
 ## What's intentionally not here yet
 

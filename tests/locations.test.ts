@@ -229,11 +229,12 @@ describe("locations", () => {
     });
 
     it("shows a location_media row in the detail response as a computed url, never the raw storage_key", async () => {
-      // Phase 3 grants the owning host direct write access to location_media
-      // (RLS-enforced) — the real API path is tests/media.test.ts's full
-      // upload flow; this just proves the detail response's media mapping.
-      const hostClient = createUserScopedClient(host.accessToken);
-      const { error } = await hostClient
+      // Phase 12: authenticated has no INSERT grant on location_media at all
+      // (only completeUpload()'s own headObject-verified write, via
+      // adminClient, may ever create a row) — this fixture seeds one
+      // directly via adminClient purely to test the detail response's media
+      // mapping; the real API path is tests/media.test.ts's full upload flow.
+      const { error } = await adminClient
         .from("location_media")
         .insert({ location_id: locationId, media_type: "photo", storage_key: "locations/test/photo1.jpg", position: 0 });
       expect(error).toBeNull();
