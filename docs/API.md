@@ -174,15 +174,17 @@ visible only to the owning host or an admin — otherwise `404` (existence isn't
     "categories": [{ "id": "...", "name": "Studio" }],
     "amenities": [{ "id": "...", "name": "Parking" }],
     "use_cases": [{ "id": "...", "name": "Film" }],
-    "media": [],
+    "media": [
+      { "id": "...", "media_type": "photo", "url": "https://media.prodbnb.com/locations/6e2c.../a1b2.../original", "position": 0, "created_at": "...", "updated_at": "..." }
+    ],
     "host": { "id": "b1f2...", "first_name": "Alex", "last_name": "Producer", "avatar_url": null }
   }
 }
 ```
 
 `host` is `null` until that host has at least one `published` location — see
-[`docs/DATABASE.md`](DATABASE.md#get_host_public_profile). `media` is always `[]` in this phase
-(no upload endpoint yet — Phase 3).
+[`docs/DATABASE.md`](DATABASE.md#get_host_public_profile). Each `media` item exposes a computed
+`url`, never the internal `storage_key` — see the media endpoints below for how it gets there.
 
 ### `POST /v1/locations`
 
@@ -257,8 +259,75 @@ Query: `?page=1&pageSize=20&status=submitted` (`status` optional, one of the 8 l
 No authentication. The full lookup list for each, `{ "data": [ { "id": "...", "name": "..." } ] }`.
 No write endpoint — see [`docs/DATABASE.md`](DATABASE.md#categories--amenities--use_cases).
 
+## Media (Cloudflare R2 — Phase 3)
+
+Binary files are never routed through this backend — see
+[`docs/DATABASE.md`](DATABASE.md#media-storage-phase-3-cloudflare-r2) for the full architecture.
+Every endpoint below requires the caller to own `:id` or be admin, using the same 404-vs-403 rule
+as `PATCH`/`DELETE /v1/locations/:id`.
+
+### `POST /v1/locations/:id/media/upload`
+
+Requires authentication (owner or admin). Requests authorization for a direct-to-R2 upload —
+does **not** write anything to the database yet.
+
+Request: `{ "media_type": "photo", "content_type": "image/jpeg", "size_bytes": 2048576 }`
+(`media_type` is `"photo"` or `"video"`; `content_type` must be one of the allowed types for
+that `media_type`; `size_bytes` must be within the configured limit.)
+
+Response (`201`) — **only temporary, safe information, nothing else**:
+
+```json
+{
+  "data": {
+    "media_id": "a1b2...",
+    "upload_url": "https://<account>.r2.cloudflarestorage.com/<bucket>/locations/6e2c.../a1b2.../original?X-Amz-...",
+    "method": "PUT",
+    "headers": { "Content-Type": "image/jpeg", "Content-Length": "2048576" },
+    "expires_at": "2026-09-03T12:15:00Z"
+  }
+}
+```
+
+The client then issues a raw `PUT` to `upload_url` with **exactly** those headers and the file
+bytes as the body — the URL's signature only validates if the actual request matches.
+
+- `400 VALIDATION_ERROR` for a disallowed `content_type`/`media_type` pairing or an over-limit
+  `size_bytes`.
+
+### `POST /v1/locations/:id/media/:mediaId/complete`
+
+Requires authentication (owner or admin). Call this after the `PUT` above succeeds. The backend
+verifies directly with R2 that the object exists (never trusts the client's word for it) before
+recording it.
+
+Request: `{ "position": 0 }` (optional — defaults to appended-at-the-end)
+
+Response (`201`): `{ "data": { "id": "a1b2...", "media_type": "photo", "url": "https://...", "position": 0, "created_at": "...", "updated_at": "..." } }`
+
+- `404 NOT_FOUND` if nothing has actually been uploaded to the expected object yet.
+- `400 VALIDATION_ERROR` if the uploaded object's real content-type/size don't pass validation.
+
+### `GET /v1/locations/:id/media`
+
+Optional authentication — same visibility as `GET /v1/locations/:id` (published is public,
+otherwise owner/admin only). Returns the location's media, ordered by `position`.
+
+### `PATCH /v1/locations/:id/media/:mediaId`
+
+Requires authentication (owner or admin). Only `{ "position": <integer> }` is accepted — nothing
+else about a media item is mutable after creation. Sets the raw position; it does not
+automatically renumber sibling items, so a clean reorder means patching every item that moved.
+
+### `DELETE /v1/locations/:id/media/:mediaId`
+
+Requires authentication (owner or admin). Deletes the R2 object and the metadata row.
+
+Response (`200`): `{ "data": { "id": "a1b2...", "deleted": true } }`
+
 ## What's intentionally not here yet
 
-Bookings, payments, reviews, messaging, notifications, real media upload (Cloudflare R2), and
-search/discovery are later phases — see the main project brief. Phase 2 only proves the listing
-data model, lifecycle, ownership, and RLS those phases will build on.
+Bookings, payments, reviews, messaging, notifications, and search/discovery are later phases —
+see the main project brief. Video transcoding, image processing, and AI analysis are explicitly
+out of scope for the R2 integration itself. Phase 3 only proves the media storage foundation
+those future refinements would build on.

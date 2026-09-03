@@ -204,9 +204,8 @@ Metadata only — actual files live in Cloudflare R2 starting Phase 3.
 | `metadata` | `jsonb` | optional (width/height/duration/alt-text later) |
 | `created_at`, `updated_at` | `timestamptz` | |
 
-No write endpoint exists yet, and no write grant to `authenticated`/`anon` either — there's no
-upload flow to produce a real `storage_key`, so there's nothing for a write endpoint to do until
-Phase 3 adds both the grant and the "register this uploaded object" endpoint together.
+Phase 2 shipped this with no write grant at all (there was no upload flow yet to produce a real
+`storage_key`). Phase 3 adds the write path — see "Media storage" below.
 
 ### `get_host_public_profile()`
 
@@ -238,8 +237,83 @@ table's migration statements include the grants from the start.
   parent location's own visibility. **INSERT/DELETE** — requires owning the parent location (or
   admin); no separate role check needed, since ownership already implies the row's creator was
   a host.
-- **`location_media` SELECT** — mirrors the parent location's visibility. No INSERT/UPDATE/DELETE
-  grant to `authenticated`/`anon` at all this phase (see above).
+- **`location_media` SELECT** — mirrors the parent location's visibility (unchanged since Phase
+  2). **INSERT/UPDATE/DELETE** — added in Phase 3, same "owns the parent location, or admin"
+  pattern as the join tables above — see "Media storage" below.
+
+## Media storage (Phase 3): Cloudflare R2
+
+**R2 stores the actual photo/video bytes. Postgres (`location_media`) stores only metadata and a
+reference key — never binaries.** Supabase Auth remains the identity layer; the backend is the
+only thing that ever holds R2 credentials or decides who's allowed to write where.
+
+### Object-key strategy
+
+`locations/{location_id}/{media_id}/original` — no file extension. The actual content type is
+stored as the R2 object's own `Content-Type` (set at upload time via the presigned `PUT`), which
+is how every S3-compatible store serves the right type on `GET` regardless of the key's shape.
+Both `location_id` and `media_id` are UUIDs, so the key is inherently collision-free and never
+derived from a client-supplied filename.
+
+### Upload flow (`src/modules/media/`, `src/lib/r2.ts`)
+
+1. `POST /v1/locations/:id/media/upload` — caller must own `:id` or be admin. Declares
+   `media_type`/`content_type`/`size_bytes`; both are validated (content-type against a fixed
+   per-media-type allowlist, size against `MEDIA_MAX_PHOTO_SIZE_MB`/`MEDIA_MAX_VIDEO_SIZE_MB`).
+   The backend mints `media_id`, derives the key, and signs a `PutObjectCommand` with
+   `ContentType`/`ContentLength` **pinned** — R2 will only accept a `PUT` whose actual headers
+   match exactly, so a client can't upload a different type or a bigger file than what was
+   authorized. Nothing is written to Postgres yet.
+2. The client `PUT`s the raw bytes straight to the returned URL — the backend server never sees
+   the file.
+3. `POST /v1/locations/:id/media/:mediaId/complete` — same ownership check, then a `HeadObject`
+   call asks R2 directly whether something now exists at that key (never trusts "the client says
+   it uploaded"). `media_type` is derived from the *actual* stored content-type, size is
+   re-checked, and only then is the `location_media` row inserted (`id = mediaId`, so the id the
+   client already has becomes the row's real id).
+
+No "pending upload" table exists between steps 1 and 3 — the key is fully deterministic from
+`(location_id, media_id)`, and the only way real bytes can land at that exact key is through a
+presigned `PUT` the backend only ever issues after verifying ownership, so there's nothing worth
+persisting in between.
+
+### Public access model
+
+`GET /v1/locations/:id/media` and the location detail response both return a computed `url`
+(`R2_PUBLIC_BASE_URL` + `storage_key`) — never the raw `storage_key`. The bucket itself is
+public, keyed by unguessable UUIDs; **access control for draft/unpublished media is enforced by
+never revealing the key through the API for a location the caller can't already see** (the
+existing `location_media_select_via_location` RLS policy), not by R2 bucket permissions. This
+was a deliberate choice over presigned, expiring `GET` URLs — a public marketplace gallery wants
+stable, cacheable image URLs, and `R2_PUBLIC_BASE_URL` only makes sense for a public-bucket
+setup. Worth knowing if the security model ever needs to be stricter: swapping to presigned
+`GET`s is a change to `publicUrlFor()` alone, nothing about ownership/authorization changes.
+
+### Deletion
+
+`DELETE /v1/locations/:id/media/:mediaId` (owner or admin) deletes the R2 object first —
+best-effort, logged but not fatal, since a transient R2 error shouldn't block a host from
+removing something from their own listing — then the `location_media` row.
+
+### Limits (configurable via env, see `.env.example`)
+
+| | Default |
+|---|---|
+| Photo max size | 20 MB (`MEDIA_MAX_PHOTO_SIZE_MB`) |
+| Video max size | 500 MB (`MEDIA_MAX_VIDEO_SIZE_MB`) |
+| Presigned upload URL validity | 15 min (`R2_UPLOAD_URL_EXPIRY_SECONDS`) |
+
+Allowed content types are a fixed constant in `src/modules/media/media.schema.ts`, not
+env-configurable (a content-safety decision, not a numeric "limit"): `photo` → `image/jpeg,
+image/png, image/webp`; `video` → `video/mp4, video/quicktime, video/webm`.
+
+### Testing without real R2 credentials
+
+`tests/media.test.ts` replaces `src/lib/r2.ts` wholesale with `vi.mock` — a small in-memory
+object store standing in for R2, seeded by the test to simulate "a client actually uploaded"
+before calling `/complete`. This exercises every bit of real business logic (ownership,
+validation, the 404-vs-403 distinction, ordering) without needing a real bucket to run `npm
+test`. Real end-to-end verification (an actual `PUT` to actual R2) needs real values in `.env`.
 
 ## Granting the admin role
 

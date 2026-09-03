@@ -1,5 +1,6 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { ForbiddenError, NotFoundError, ValidationError } from "../../errors/AppError";
+import { publicUrlFor } from "../../lib/r2";
 import { CreateLocationInput, UpdateLocationInput } from "./locations.schema";
 
 const FOREIGN_KEY_VIOLATION = "23503";
@@ -62,7 +63,8 @@ export interface HostPublicSummary {
   avatar_url: string | null;
 }
 
-export interface LocationMediaItem {
+/** Raw shape as stored/queried — never returned to a client (storage_key is an internal R2 detail). */
+interface RawLocationMediaRow {
   id: string;
   media_type: "photo" | "video";
   storage_key: string;
@@ -72,11 +74,32 @@ export interface LocationMediaItem {
   updated_at: string;
 }
 
+/** Public-facing shape: a computed `url`, never the raw storage key. */
+export interface PublicMediaItem {
+  id: string;
+  media_type: "photo" | "video";
+  url: string;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export function toPublicMediaItem(row: RawLocationMediaRow): PublicMediaItem {
+  return {
+    id: row.id,
+    media_type: row.media_type,
+    url: publicUrlFor(row.storage_key),
+    position: row.position,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
 export interface LocationDetail extends LocationSummary {
   categories: CatalogRef[];
   amenities: CatalogRef[];
   use_cases: CatalogRef[];
-  media: LocationMediaItem[];
+  media: PublicMediaItem[];
   host: HostPublicSummary | null;
 }
 
@@ -84,7 +107,7 @@ interface RawLocationDetailRow extends LocationSummary {
   location_categories: { categories: CatalogRef }[];
   location_amenities: { amenities: CatalogRef }[];
   location_use_cases: { use_cases: CatalogRef }[];
-  location_media: LocationMediaItem[];
+  location_media: RawLocationMediaRow[];
 }
 
 function flattenDetail(row: RawLocationDetailRow, host: HostPublicSummary | null): LocationDetail {
@@ -95,7 +118,7 @@ function flattenDetail(row: RawLocationDetailRow, host: HostPublicSummary | null
     categories: location_categories.map((r) => r.categories),
     amenities: location_amenities.map((r) => r.amenities),
     use_cases: location_use_cases.map((r) => r.use_cases),
-    media: location_media,
+    media: location_media.map(toPublicMediaItem).sort((a, b) => a.position - b.position),
     host,
   };
 }
@@ -108,7 +131,7 @@ async function fetchHostPublicSummary(supabase: SupabaseClient, hostId: string):
   return (data as HostPublicSummary | null) ?? null;
 }
 
-async function getVisibleLocationOrNull(supabase: SupabaseClient, id: string): Promise<LocationSummary | null> {
+export async function getVisibleLocationOrNull(supabase: SupabaseClient, id: string): Promise<LocationSummary | null> {
   const { data, error } = await supabase.from("locations").select(LOCATION_COLUMNS).eq("id", id).maybeSingle();
   if (error) {
     throw error;

@@ -228,25 +228,21 @@ describe("locations", () => {
       expect(patchRes.body.error.code).toBe("FORBIDDEN");
     });
 
-    it("shows a location_media row in the detail response once one exists", async () => {
+    it("shows a location_media row in the detail response as a computed url, never the raw storage_key", async () => {
+      // Phase 3 grants the owning host direct write access to location_media
+      // (RLS-enforced) — the real API path is tests/media.test.ts's full
+      // upload flow; this just proves the detail response's media mapping.
       const hostClient = createUserScopedClient(host.accessToken);
       const { error } = await hostClient
         .from("location_media")
         .insert({ location_id: locationId, media_type: "photo", storage_key: "locations/test/photo1.jpg", position: 0 });
-      // No write grant to authenticated on location_media yet (Phase 3 concern) —
-      // insert via the request-scoped client should be rejected at the DB level.
-      expect(error).not.toBeNull();
-
-      // Register it the only way currently possible: service_role (stands in
-      // for the future Phase 3 "register uploaded media" backend action).
-      const { error: adminInsertError } = await adminClient
-        .from("location_media")
-        .insert({ location_id: locationId, media_type: "photo", storage_key: "locations/test/photo1.jpg", position: 0 });
-      expect(adminInsertError).toBeNull();
+      expect(error).toBeNull();
 
       const res = await request(app).get(`/v1/locations/${locationId}`);
       expect(res.body.data.media).toHaveLength(1);
-      expect(res.body.data.media[0]).toMatchObject({ media_type: "photo", storage_key: "locations/test/photo1.jpg" });
+      expect(res.body.data.media[0]).toMatchObject({ media_type: "photo" });
+      expect(res.body.data.media[0].url).toContain("locations/test/photo1.jpg");
+      expect(res.body.data.media[0].storage_key).toBeUndefined();
     });
 
     it("lets the owning host delete it", async () => {
