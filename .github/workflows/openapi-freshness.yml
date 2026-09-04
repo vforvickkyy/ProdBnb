@@ -1,0 +1,50 @@
+name: OpenAPI freshness
+
+# Guards the contract the separate Admin Panel repo depends on. That repo
+# commits a generated src/types/admin-api.d.ts (Phase 13) rather than
+# regenerating it at build time, specifically so it can build in isolation
+# without access to this repo's filesystem — which means docs/admin-openapi.json
+# committed HERE is the actual source of truth the Admin Panel trusts, and it
+# must never be allowed to silently drift from what the admin module's zod
+# schemas would actually generate. This workflow is that guarantee: it fails
+# the build the moment someone changes an admin route/schema without also
+# running `npm run generate:openapi` and committing the result.
+#
+# Deliberately does NOT run the test suite here — the tests
+# (tests/setup.ts) require a live, reachable Supabase project with real R2/
+# Cashfree-shaped credentials just to pass env validation at module load
+# (src/config/env.ts has no mock/disabled mode for either), which this
+# workflow has no access to and shouldn't be given for a contract-only check.
+
+on:
+  push:
+    branches: [main, staging, production]
+  pull_request:
+    branches: [main, staging, production]
+
+jobs:
+  openapi-freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Regenerate OpenAPI contract
+        run: npm run generate:openapi
+
+      - name: Fail if the committed contract is stale
+        run: |
+          if ! git diff --exit-code docs/admin-openapi.json; then
+            echo "::error::docs/admin-openapi.json is out of date. Run 'npm run generate:openapi' locally and commit the result."
+            exit 1
+          fi

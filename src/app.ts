@@ -2,7 +2,9 @@ import cors from "cors";
 import express, { Express } from "express";
 import helmet from "helmet";
 import { env } from "./config/env";
+import { anonClient } from "./lib/supabase";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
+import { generalLimiter } from "./middleware/rateLimit";
 import { adminRouter } from "./modules/admin/admin.routes";
 import { availabilityRouter } from "./modules/availability/availability.routes";
 import { bookingsRouter } from "./modules/bookings/bookings.routes";
@@ -17,8 +19,35 @@ import { pricingRouter } from "./modules/pricing/pricing.routes";
 import { rolesRouter } from "./modules/roles/roles.routes";
 import { usersRouter } from "./modules/users/users.routes";
 
+/** Never resolves later than `ms` — bounds the readiness check below so a
+ * hung Supabase call can't hang /health/ready (and therefore a platform's
+ * deploy-gating health check) indefinitely. */
+function withTimeout<T>(promise: PromiseLike<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 export function createApp(): Express {
   const app = express();
+
+  // Render (and most PaaS reverse-proxy setups — Railway, Heroku-style)
+  // put exactly one proxy hop in front of this process. Trusting that one
+  // hop is what lets req.ip (and therefore express-rate-limit's default
+  // key) reflect the real client IP from X-Forwarded-For rather than the
+  // proxy's own address. See src/middleware/rateLimit.ts for the fuller
+  // explanation and what changes if a CDN/WAF is ever added in front.
+  app.set("trust proxy", 1);
 
   app.use(helmet());
   app.use(cors({ origin: env.CORS_ORIGINS.length > 0 ? env.CORS_ORIGINS : false }));
@@ -29,12 +58,40 @@ export function createApp(): Express {
   // express.json() would otherwise parse-and-discard before this handler
   // ever saw them. Every other route is unaffected: express.raw() only
   // consumes application/json bodies posted to this one path.
+  //
+  // Also deliberately registered BEFORE generalLimiter below: this path is
+  // called by Cashfree's own servers, not end users, and a silently
+  // rate-limited payment webhook is a worse failure mode than an
+  // unrate-limited one -- payment reconciliation depends on it arriving.
   app.post("/v1/payments/webhooks/cashfree", express.raw({ type: "application/json" }), postCashfreeWebhook);
 
+  app.use(generalLimiter);
   app.use(express.json());
 
+  // Liveness -- unconditional, unchanged: "is the process up at all."
   app.get("/health", (_req, res) => {
     res.status(200).json({ data: { status: "ok" } });
+  });
+
+  // Readiness -- "is this instance actually able to serve traffic." Checked
+  // separately from /health (Phase 13) so a platform's deploy-gating health
+  // check (e.g. Render's Health Check Path) can be pointed at whichever one
+  // is appropriate: /health for a pure liveness probe, /health/ready to also
+  // gate on the database being reachable before traffic is promoted to a
+  // new deploy. Bounded to 3s so a hung Supabase call can't hang this
+  // endpoint indefinitely; queries the smallest public, already-RLS-open
+  // lookup table (no auth, no row content, no internals in the response).
+  app.get("/health/ready", async (_req, res) => {
+    try {
+      const { error } = await withTimeout(anonClient.from("categories").select("id").limit(1), 3000);
+      if (error) {
+        throw error;
+      }
+      res.status(200).json({ data: { status: "ready" } });
+    } catch (err) {
+      console.error("Readiness check failed:", err);
+      res.status(503).json({ error: { code: "SERVICE_UNAVAILABLE", message: "Not ready to accept traffic." } });
+    }
   });
 
   app.use("/v1", usersRouter);

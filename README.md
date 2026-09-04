@@ -22,10 +22,17 @@ frontend project), and Phase 12 (security + performance hardening audit — clos
 column/grant-level RLS gap shared by `bookings`/`locations`/`location_media`, two payment/refund
 TOCTOU races, and an admin audit-log completeness gap on two pre-Phase-11 routes; added four
 indexes for existing admin/host listing query patterns; see
-[`docs/DATABASE.md`](docs/DATABASE.md#rlsgrant-hardening-phase-12)) are done. Phases 9 (Favorites +
+[`docs/DATABASE.md`](docs/DATABASE.md#rlsgrant-hardening-phase-12)), and Phase 13 (staging +
+production deployment readiness — a Supabase-connectivity readiness check at `/health/ready`
+separate from the plain liveness `/health`, graceful `SIGTERM` shutdown, lightweight rate limiting
+on payment creation and the API generally, and the Admin Panel's committed-not-generated OpenAPI
+types so it can build in an isolated CI/deploy pipeline; see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)) are done. Phases 9 (Favorites +
 Reviews) and 10 (Messaging/Chat) are intentionally skipped for now. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
-[`docs/DATABASE.md`](docs/DATABASE.md), and [`docs/API.md`](docs/API.md) for the full picture.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DATABASE.md`](docs/DATABASE.md),
+[`docs/API.md`](docs/API.md), [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md),
+[`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md), and
+[`docs/PRODUCTION_RUNBOOK.md`](docs/PRODUCTION_RUNBOOK.md) for the full picture.
 **The notification system is fully developed and tested without any Apple Developer account or
 APNs credentials** — it defaults to an explicit `disabled` provider that records every push
 attempt honestly rather than pretending success (see

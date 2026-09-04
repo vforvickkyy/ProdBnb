@@ -11,6 +11,12 @@ describe("authentication", () => {
     expect(res.body).toEqual({ data: { status: "ok" } });
   });
 
+  it("/health/ready confirms real Supabase connectivity, unauthenticated, with no internals leaked", async () => {
+    const res = await request(app).get("/health/ready");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ data: { status: "ready" } });
+  });
+
   it("rejects /v1/me with no Authorization header", async () => {
     const res = await request(app).get("/v1/me");
     expect(res.status).toBe(401);

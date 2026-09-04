@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../../middleware/auth";
+import { paymentCreationLimiter } from "../../middleware/rateLimit";
 import { validate } from "../../middleware/validate";
 import { bookingIdParamSchema } from "../bookings/bookings.schema";
 import {
@@ -17,9 +18,13 @@ export const paymentsRouter = Router();
 // Authorization (booker-owns-this-booking, payable status) is enforced in
 // payment.service.ts, not here -- same "RLS/service decides, route just
 // authenticates" split every other module in this codebase already uses.
+// paymentCreationLimiter runs after requireAuth specifically so it can key
+// on the authenticated caller (req.user.id), not just IP -- see
+// middleware/rateLimit.ts.
 paymentsRouter.post(
   "/bookings/:id/payment",
   requireAuth,
+  paymentCreationLimiter,
   validate({ params: bookingIdParamSchema, body: createPaymentSchema }),
   postPayment
 );

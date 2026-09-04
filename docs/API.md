@@ -59,11 +59,24 @@ Offset-based via query params, demonstrated on `GET /v1/admin/users`:
 
 ### `GET /health`
 
-No authentication. Liveness check.
+No authentication. Liveness check — unconditional, does not check Supabase connectivity.
 
 ```json
 { "data": { "status": "ok" } }
 ```
+
+### `GET /health/ready`
+
+No authentication. Readiness check (Phase 13) — confirms real Supabase connectivity, bounded to
+3s. Used as the deploy-gating health check path on hosting platforms (e.g. Render's Health Check
+Path) so a build that can't reach the database doesn't get promoted to serve traffic.
+
+```json
+{ "data": { "status": "ready" } }
+```
+
+`503` (`{ "error": { "code": "SERVICE_UNAVAILABLE", "message": "Not ready to accept traffic." } }`)
+if the connectivity check fails or times out — never leaks the underlying error/connection detail.
 
 ### `GET /v1/me`
 
