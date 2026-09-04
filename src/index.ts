@@ -1,16 +1,15 @@
-import { createApp } from "./app";
+import app from "./app";
 import { env } from "./config/env";
 
 // Local dev / any traditional persistent-process Node host only (`npm run
-// dev`, `npm start`). NOT what runs on Vercel -- api/index.ts is Vercel's
-// entrypoint, which imports createApp() directly and exports the app for
-// Vercel's own Function wrapper to invoke; it never calls .listen() and
-// this file's SIGTERM/SIGINT handling below never executes in that context.
-// Kept exactly as-is here because it's still correct and useful for local
-// dev (e.g. Ctrl-C exits cleanly) and for any non-Vercel Node host, and
-// removing it would provide no benefit -- it simply isn't reachable code
-// from Vercel's perspective, not code that would misbehave there.
-const app = createApp();
+// dev`, `npm start`). NOT what runs on Vercel -- Vercel's native Express
+// framework detection loads src/app.ts's default export directly and never
+// calls .listen() on it, so this file's SIGTERM/SIGINT handling below never
+// executes in that context. Reuses the same app instance src/app.ts already
+// constructed (imported here, not rebuilt) so there is exactly one
+// createApp() call for the whole process either way. Kept exactly as-is
+// here because it's still correct and useful for local dev (e.g. Ctrl-C
+// exits cleanly) and for any non-Vercel Node host.
 
 const server = app.listen(env.PORT, () => {
   console.log(`ProdBnb backend listening on port ${env.PORT} (${env.NODE_ENV})`);

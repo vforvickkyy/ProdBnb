@@ -123,3 +123,12 @@ export function createApp(): Express {
 
   return app;
 }
+
+// The single, authoritative Express app instance for this process. Vercel's
+// native Express framework detection (Project Settings -> Framework Preset:
+// Express) requires this file's default export to be the app itself, not a
+// factory -- see docs/DEPLOYMENT.md. src/index.ts imports this same instance
+// rather than calling createApp() again, so there is exactly one app
+// constructed per process, on Vercel or anywhere else.
+const app = createApp();
+export default app;
