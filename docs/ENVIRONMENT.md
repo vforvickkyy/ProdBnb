@@ -3,14 +3,17 @@
 The source of truth for what each environment needs — referenced instead of re-deriving it from
 `.env.example` each time a new environment is set up. `src/config/env.ts` validates all of this at
 process startup via zod and **fails fast**: if anything required is missing or invalid, the process
-throws and exits immediately rather than starting in a partially-configured state. On Render this
-surfaces as a deploy that never passes its health check.
+throws and exits immediately rather than starting in a partially-configured state. On Vercel a
+missing/invalid variable surfaces as every request to the function failing (`FUNCTION_INVOCATION_
+FAILED` or a 500) rather than a build-time failure, since Vercel bundles the Express app directly
+rather than running this repo's own build/start scripts — see `docs/DEPLOYMENT.md`. Set every
+variable before the first deploy, not after.
 
 ## Backend
 
 | Variable | Classification | dev (existing, unchanged) | staging | production |
 |---|---|---|---|---|
-| `PORT` | server-only | Render-provided | Render-provided | Render-provided |
+| `PORT` | not used on Vercel | local dev only | n/a (Vercel manages this) | n/a (Vercel manages this) |
 | `NODE_ENV` | server-only | `development` | `production` | `production` |
 | `CORS_ORIGINS` | server-only | local dev value | `https://staging-admin.prodbnb.com` | `https://admin.prodbnb.com` |
 | `API_BASE_URL` | server-only, **highest-risk value** | unchanged | `https://staging-api.prodbnb.com` | `https://api.prodbnb.com` |
@@ -55,6 +58,9 @@ existing build.
 ## What must never reach the Admin Panel, any client, or Git
 
 `SUPABASE_SERVICE_ROLE_KEY`, `CASHFREE_SECRET_KEY`, `APNS_PRIVATE_KEY`, `R2_ACCESS_KEY_ID`/
-`R2_SECRET_ACCESS_KEY`, any webhook secret, any Postgres connection string. Store these in each
-platform's own environment-variable UI (Render/Vercel) or a password manager — never in a repo,
-never in shell history files, never pasted into chat.
+`R2_SECRET_ACCESS_KEY`, any webhook secret, any Postgres connection string. Store these in Vercel's
+own per-Project environment-variable UI or a password manager — never in a repo, never in shell
+history files, never pasted into chat. Note Vercel's own env vars are scoped per-Project (not
+shared across the backend and Admin Panel Projects, and not shared across environments unless you
+explicitly mark them so) — staging and production Projects each get their own values, set
+independently, exactly matching the isolation this table describes.

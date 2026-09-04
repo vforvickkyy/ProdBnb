@@ -68,8 +68,8 @@ No authentication. Liveness check — unconditional, does not check Supabase con
 ### `GET /health/ready`
 
 No authentication. Readiness check (Phase 13) — confirms real Supabase connectivity, bounded to
-3s. Used as the deploy-gating health check path on hosting platforms (e.g. Render's Health Check
-Path) so a build that can't reach the database doesn't get promoted to serve traffic.
+3s. On Vercel this is a manual/external-monitoring check rather than a platform-enforced deploy
+gate (Vercel promotes on successful build, not a runtime probe) — see `docs/PRODUCTION_RUNBOOK.md`.
 
 ```json
 { "data": { "status": "ready" } }

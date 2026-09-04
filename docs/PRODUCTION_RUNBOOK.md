@@ -11,14 +11,19 @@ it live (with `CASHFREE_ENV=test`/`NOTIFICATION_PROVIDER=disabled` still in plac
 stays closed to real payment/push traffic until the separate Cashfree/APNs production phase ships).
 
 **Health**
-- [ ] `GET /health` → `200 {"data":{"status":"ok"}}` — process liveness only.
+- [ ] `GET /health` → `200 {"data":{"status":"ok"}}` — **do this first, before anything else on
+      this list.** This is the one thing that could not be verified locally before the first real
+      deploy (`vercel dev --local`, deliberately used to avoid creating a Vercel Project before
+      approval, does not fully emulate the `vercel.json` catch-all rewrite that routes this and
+      every other top-level path to the deployed function — see `docs/DEPLOYMENT.md`). If this
+      404s or 500s, nothing else on this checklist will work either.
 - [ ] `GET /health/ready` → `200 {"data":{"status":"ready"}}` — confirms real Supabase
-      connectivity, bounded to 3s, no internals leaked on failure (just a generic `503`).
-- [ ] Watch a real deploy: Render's Health Check Path (set to `/health/ready`) gates traffic
-      promotion correctly — a build that can't reach Supabase should not go live.
-- [ ] `kill -TERM <pid>` locally against a running build (or trigger a real deploy) and confirm the
-      "shutting down gracefully" / "all connections closed" log lines appear and the process exits
-      cleanly, not by force-kill.
+      connectivity, bounded to 3s, no internals leaked on failure (just a generic `503`). Unlike a
+      persistent-process host, Vercel doesn't gate deploy promotion on this automatically — treat
+      it as a manual/monitoring check, not a platform-enforced one.
+- [ ] Graceful-shutdown log lines (`SIGTERM`/`SIGINT` handling in `src/index.ts`) are **not**
+      applicable to the deployed Vercel function — that code path only runs for local dev
+      (`npm run dev`) and any non-Vercel Node host. Nothing to verify here for a Vercel deployment.
 
 **Auth**
 - [ ] Sign up via Supabase Auth against the environment's own project.
@@ -78,9 +83,10 @@ stays closed to real payment/push traffic until the separate Cashfree/APNs produ
 
 ## Rollback / disaster recovery
 
-**Application rollback**: Render's "Rollback to this deploy" (backend) / Vercel's "Promote to
-Production" on any prior deployment (Admin Panel). Both are one action. They're independent — a
-change spanning both repos needs both rolled back deliberately, not assumed to happen together.
+**Application rollback**: Vercel's "Promote to Production" (or "Instant Rollback") on any prior
+deployment — one action, available for both the backend and Admin Panel Projects independently.
+They're separate Projects — a change spanning both repos needs both rolled back deliberately, not
+assumed to happen together.
 
 **Database rollback does not exist as a single action.** The Supabase CLI has no down-migrations.
 Reversing a schema change means writing and pushing a *new* forward migration through the full
@@ -110,14 +116,21 @@ is written independently and is unaffected.
 
 ## Known, accepted limitations at this stage (not bugs — documented trade-offs)
 
-- **Rate limiting is in-memory, per-instance.** Correct and sufficient at one Render instance per
-  environment (the current deployment target). If ever scaled to multiple instances, the effective
-  limit becomes `configured limit × instance count` — would need a shared store (e.g. Redis) to
-  stay exact. Not solved speculatively.
-- **Rate limiting assumes exactly one reverse-proxy hop** (`app.set("trust proxy", 1)` in
-  `src/app.ts`, matching Render/Railway/Heroku-style platforms). Adding a CDN/WAF in front later
-  (e.g. Cloudflare orange-cloud) changes the hop count and needs this revisited, or `req.ip`
-  resolves to the wrong address.
+- **Rate limiting is in-memory, per-Vercel-Function-instance.** Vercel's Fluid compute genuinely
+  does let in-memory state persist and be shared across concurrent requests on the same warm
+  instance — but Vercel spins up additional instances (each with separate memory) once a running
+  one has no spare capacity, which is exactly the condition a burst of abusive traffic is likely to
+  trigger. Strong at normal traffic, softer specifically under the load this exists to defend
+  against. Vercel's own guidance recommends an external store (Vercel KV / Upstash Redis) for
+  anything needing an authoritative cross-instance count — kept in-memory here as a real,
+  non-zero defense-in-depth layer appropriate for pre-launch scale; revisit with a shared store
+  once real traffic/attack patterns justify it, not speculatively.
+- **Rate limiting's client-IP determination reads `x-vercel-forwarded-for` directly**
+  (`src/middleware/rateLimit.ts`), not Express's trust-proxy hop-counting — Vercel documents that
+  it overwrites `X-Forwarded-For` at its edge with the real, unspoofable client IP, and this header
+  is a guaranteed-untampered copy of the same value, kept distinct specifically for the case where
+  something else sits in front of Vercel too. If a CDN/WAF is ever added in front of Vercel itself,
+  confirm this header still reflects the real client, not the CDN's own address.
 - **No distributed session revocation.** Suspending a user blocks their *next* authenticated
   request; it doesn't invalidate an already-issued, not-yet-expired JWT mid-flight. Documented,
   small, known window — not addressed by this phase.

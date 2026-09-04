@@ -41,12 +41,14 @@ function withTimeout<T>(promise: PromiseLike<T>, ms: number): Promise<T> {
 export function createApp(): Express {
   const app = express();
 
-  // Render (and most PaaS reverse-proxy setups — Railway, Heroku-style)
-  // put exactly one proxy hop in front of this process. Trusting that one
-  // hop is what lets req.ip (and therefore express-rate-limit's default
-  // key) reflect the real client IP from X-Forwarded-For rather than the
-  // proxy's own address. See src/middleware/rateLimit.ts for the fuller
-  // explanation and what changes if a CDN/WAF is ever added in front.
+  // Affects req.protocol/req.secure (correctly read X-Forwarded-Proto from
+  // Vercel's edge rather than assuming plain HTTP) and is a safe default for
+  // req.ip generally. The rate limiter does NOT rely on this for its actual
+  // security-relevant IP determination, though -- see clientIp() in
+  // src/middleware/rateLimit.ts, which reads Vercel's own
+  // x-vercel-forwarded-for header directly instead of hop-counting (Vercel's
+  // edge network doesn't map cleanly onto Express's "N proxies in front of
+  // me" trust-proxy model the way a single self-managed reverse proxy does).
   app.set("trust proxy", 1);
 
   app.use(helmet());
@@ -74,13 +76,16 @@ export function createApp(): Express {
   });
 
   // Readiness -- "is this instance actually able to serve traffic." Checked
-  // separately from /health (Phase 13) so a platform's deploy-gating health
-  // check (e.g. Render's Health Check Path) can be pointed at whichever one
-  // is appropriate: /health for a pure liveness probe, /health/ready to also
-  // gate on the database being reachable before traffic is promoted to a
-  // new deploy. Bounded to 3s so a hung Supabase call can't hang this
-  // endpoint indefinitely; queries the smallest public, already-RLS-open
-  // lookup table (no auth, no row content, no internals in the response).
+  // separately from /health (Phase 13) so external uptime monitoring / a
+  // manual post-deploy check can distinguish "process is up" from "the
+  // database is actually reachable." Unlike a persistent-process host,
+  // Vercel promotes a deployment on successful BUILD, not a runtime health
+  // probe -- there is no platform-level mechanism this endpoint gates the
+  // way it would on e.g. Render, so treat it as a verification tool
+  // (docs/PRODUCTION_RUNBOOK.md), not an automatic deploy gate. Bounded to
+  // 3s so a hung Supabase call can't hang this endpoint indefinitely;
+  // queries the smallest public, already-RLS-open lookup table (no auth, no
+  // row content, no internals in the response).
   app.get("/health/ready", async (_req, res) => {
     try {
       const { error } = await withTimeout(anonClient.from("categories").select("id").limit(1), 3000);
