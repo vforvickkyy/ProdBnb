@@ -24,3 +24,4 @@ npm-debug.log*
 
 # Supabase Studio-saved SQL snippets (local scratch queries, not project source)
 supabase/snippets/
+.vercel
