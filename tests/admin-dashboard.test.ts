@@ -69,4 +69,19 @@ describe("admin: dashboard", () => {
 
     await deleteTestUser(target.id);
   });
+
+  it("active_hosts excludes a host whose profile is suspended", async () => {
+    const host = await createTestUser();
+    await grantRole(host, "host");
+
+    const before = await request(app).get("/v1/admin/dashboard").set(authHeader(admin));
+    const countWhileActive = before.body.data.active_hosts;
+
+    await request(app).post(`/v1/admin/users/${host.id}/suspend`).set(authHeader(admin)).send({ reason: "active_hosts regression test" });
+
+    const after = await request(app).get("/v1/admin/dashboard").set(authHeader(admin));
+    expect(after.body.data.active_hosts).toBe(countWhileActive - 1);
+
+    await deleteTestUser(host.id);
+  });
 });

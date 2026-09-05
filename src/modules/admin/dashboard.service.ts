@@ -37,7 +37,11 @@ export async function getDashboardSummary(supabase: SupabaseClient): Promise<Das
     recentAuditRes,
   ] = await Promise.all([
     supabase.from("profiles").select("id", { count: "exact", head: true }),
-    supabase.from("user_roles").select("id", { count: "exact", head: true }).eq("role", "host"),
+    supabase
+      .from("user_roles")
+      .select("id, profiles!inner(status)", { count: "exact", head: true })
+      .eq("role", "host")
+      .eq("profiles.status", "active"),
     supabase.from("locations").select("id", { count: "exact", head: true }).eq("status", "published"),
     supabase.from("locations").select("id", { count: "exact", head: true }).in("status", ["submitted", "under_review"]),
     supabase
