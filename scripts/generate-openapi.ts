@@ -477,6 +477,15 @@ registry.registerPath({
 
 // -- Notifications ------------------------------------------------------
 
+const deliveryAttemptDeviceSchema = z
+  .object({
+    platform: z.string(),
+    environment: z.string().nullable(),
+    is_active: z.boolean(),
+  })
+  .nullable()
+  .openapi("DeliveryAttemptDevice");
+
 const deliveryAttemptRowSchema = z
   .object({
     id: z.string().uuid(),
@@ -487,6 +496,7 @@ const deliveryAttemptRowSchema = z
     provider_message_id: z.string().nullable(),
     error_reason: z.string().nullable(),
     created_at: z.string().datetime(),
+    device: deliveryAttemptDeviceSchema,
   })
   .openapi("DeliveryAttemptRow");
 

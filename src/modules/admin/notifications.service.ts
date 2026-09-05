@@ -7,6 +7,12 @@ import { DeliveryAttemptsQuery } from "./admin.schema";
 // per device) -- never a user's notification content (title/body), which
 // stays strictly private (Phase 8 plan §14 / Phase 11 plan §14).
 
+export interface DeliveryAttemptDevice {
+  platform: string;
+  environment: string | null;
+  is_active: boolean;
+}
+
 export interface DeliveryAttemptRow {
   id: string;
   notification_id: string;
@@ -16,6 +22,7 @@ export interface DeliveryAttemptRow {
   provider_message_id: string | null;
   error_reason: string | null;
   created_at: string;
+  device: DeliveryAttemptDevice | null;
 }
 
 export interface PaginatedDeliveryAttempts {
@@ -23,7 +30,14 @@ export interface PaginatedDeliveryAttempts {
   total: number;
 }
 
-const DELIVERY_ATTEMPT_COLUMNS = "id, notification_id, device_id, provider, status, provider_message_id, error_reason, created_at";
+// `device_id` is a mandatory, non-cascading FK to user_devices (see the
+// Phase 8 migration), so this join never fails to resolve -- added
+// (Phase 14) purely to make a delivery attempt's status legible on its own
+// (e.g. "invalid_token" next to "device inactive" explains itself) without
+// ever selecting `device_token`, which stays excluded here exactly as it is
+// from every other admin/device response in this codebase.
+const DELIVERY_ATTEMPT_COLUMNS =
+  "id, notification_id, device_id, provider, status, provider_message_id, error_reason, created_at, device:user_devices ( platform, environment, is_active )";
 
 export async function listDeliveryAttempts(query: DeliveryAttemptsQuery): Promise<PaginatedDeliveryAttempts> {
   const from = (query.page - 1) * query.pageSize;
@@ -53,5 +67,5 @@ export async function listDeliveryAttempts(query: DeliveryAttemptsQuery): Promis
   if (error) {
     throw error;
   }
-  return { data: (data ?? []) as DeliveryAttemptRow[], total: count ?? 0 };
+  return { data: (data ?? []) as unknown as DeliveryAttemptRow[], total: count ?? 0 };
 }

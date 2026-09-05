@@ -104,6 +104,29 @@ describe("admin: notification delivery diagnostics", () => {
     expect(res.body.data).toEqual([]);
   });
 
+  it("includes device diagnostics (platform/environment/is_active) but never device_token (Phase 14)", async () => {
+    const res = await request(app).get("/v1/admin/notifications/delivery-attempts").set(authHeader(admin)).query({ booking_id: bookingId });
+    expect(res.status).toBe(200);
+    expect(res.body.data.length).toBeGreaterThanOrEqual(1);
+    const attempt = res.body.data[0];
+    expect(attempt.device).toMatchObject({ platform: "ios", is_active: true });
+    expect(attempt.device).toHaveProperty("environment");
+
+    // Every existing field must still be present -- this is an additive join,
+    // not a replacement of the response shape.
+    expect(attempt).toMatchObject({
+      provider: "disabled",
+      status: "skipped",
+    });
+    expect(attempt).toHaveProperty("id");
+    expect(attempt).toHaveProperty("device_id");
+    expect(attempt).toHaveProperty("error_reason");
+
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain("device_token");
+    expect(serialized).not.toContain("admin-diag-tok");
+  });
+
   it("filters via notification_id directly too", async () => {
     const { data: notif, error } = await adminClient
       .from("notifications")

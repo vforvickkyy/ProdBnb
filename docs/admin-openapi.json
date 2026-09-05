@@ -929,6 +929,27 @@
           "payment"
         ]
       },
+      "DeliveryAttemptDevice": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "platform": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "is_active": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "platform",
+          "environment",
+          "is_active"
+        ]
+      },
       "DeliveryAttemptRow": {
         "type": "object",
         "properties": {
@@ -967,6 +988,9 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "device": {
+            "$ref": "#/components/schemas/DeliveryAttemptDevice"
           }
         },
         "required": [
@@ -977,7 +1001,8 @@
           "status",
           "provider_message_id",
           "error_reason",
-          "created_at"
+          "created_at",
+          "device"
         ]
       },
       "AuditLogEntry": {
