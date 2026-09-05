@@ -93,6 +93,42 @@ describe("admin: audit log", () => {
     expect(entry.created_at).toBeTruthy();
   });
 
+  it("filters by action (Phase 14)", async () => {
+    const res = await request(app)
+      .get("/v1/admin/audit-log")
+      .set(authHeader(admin))
+      .query({ action: "ADMIN_SUSPENDED_USER", target_id: targetUserId });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].action).toBe("ADMIN_SUSPENDED_USER");
+
+    const wrongAction = await request(app)
+      .get("/v1/admin/audit-log")
+      .set(authHeader(admin))
+      .query({ action: "ADMIN_RESTORED_USER", target_id: targetUserId });
+    expect(wrongAction.body.data).toHaveLength(0);
+  });
+
+  it("filters by created_after/created_before, and rejects an inverted range (Phase 14)", async () => {
+    const future = await request(app)
+      .get("/v1/admin/audit-log")
+      .set(authHeader(admin))
+      .query({ target_id: targetUserId, created_after: "2099-01-01T00:00:00Z" });
+    expect(future.body.data).toHaveLength(0);
+
+    const past = await request(app)
+      .get("/v1/admin/audit-log")
+      .set(authHeader(admin))
+      .query({ target_id: targetUserId, created_after: "2020-01-01T00:00:00Z" });
+    expect(past.body.data.length).toBeGreaterThanOrEqual(1);
+
+    const inverted = await request(app)
+      .get("/v1/admin/audit-log")
+      .set(authHeader(admin))
+      .query({ created_after: "2026-01-01T00:00:00Z", created_before: "2020-01-01T00:00:00Z" });
+    expect(inverted.status).toBe(400);
+  });
+
   it("cannot be spoofed or edited by any admin -- no client-writable path exists at all", async () => {
     // Even using an authenticated ADMIN's own bearer token directly against
     // PostgREST (bypassing this backend's controllers entirely, simulating

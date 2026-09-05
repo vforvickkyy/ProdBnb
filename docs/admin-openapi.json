@@ -18,7 +18,1033 @@
         "bearerFormat": "Supabase access token"
       }
     },
-    "schemas": {},
+    "schemas": {
+      "DashboardSummary": {
+        "type": "object",
+        "properties": {
+          "total_users": {
+            "type": "integer"
+          },
+          "active_hosts": {
+            "type": "integer"
+          },
+          "published_locations": {
+            "type": "integer"
+          },
+          "locations_awaiting_approval": {
+            "type": "integer"
+          },
+          "upcoming_bookings": {
+            "type": "integer"
+          },
+          "recent_bookings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "start_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "id",
+                "status",
+                "start_at",
+                "created_at"
+              ]
+            }
+          },
+          "payment_activity_30d": {
+            "type": "object",
+            "properties": {
+              "count": {
+                "type": "integer"
+              },
+              "total_amount_minor_units": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "count",
+              "total_amount_minor_units"
+            ]
+          },
+          "refund_activity_30d": {
+            "type": "object",
+            "properties": {
+              "count": {
+                "type": "integer"
+              },
+              "total_amount_minor_units": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "count",
+              "total_amount_minor_units"
+            ]
+          },
+          "recent_admin_actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "target_type": {
+                  "type": "string"
+                },
+                "target_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "id",
+                "action",
+                "target_type",
+                "target_id",
+                "created_at"
+              ]
+            }
+          }
+        },
+        "required": [
+          "total_users",
+          "active_hosts",
+          "published_locations",
+          "locations_awaiting_approval",
+          "upcoming_bookings",
+          "recent_bookings",
+          "payment_activity_30d",
+          "refund_activity_30d",
+          "recent_admin_actions"
+        ]
+      },
+      "SystemStatus": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "payments": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "mode"
+            ]
+          },
+          "notifications": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ]
+          },
+          "media": {
+            "type": "object",
+            "properties": {
+              "configured": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "configured"
+            ]
+          }
+        },
+        "required": [
+          "environment",
+          "payments",
+          "notifications",
+          "media"
+        ]
+      },
+      "AdminUserDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "avatar_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "suspended",
+              "deleted"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "booker",
+                "host",
+                "admin"
+              ]
+            }
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_sign_in_at": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "locations_count": {
+            "type": "integer"
+          },
+          "bookings_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "first_name",
+          "last_name",
+          "avatar_url",
+          "status",
+          "created_at",
+          "updated_at",
+          "roles",
+          "email",
+          "last_sign_in_at",
+          "locations_count",
+          "bookings_count"
+        ]
+      },
+      "CatalogRef": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "PublicMediaItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "media_type": {
+            "type": "string",
+            "enum": [
+              "photo",
+              "video"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "position": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "media_type",
+          "url",
+          "position",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "HostPublicSummary": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "avatar_url": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "first_name",
+          "last_name",
+          "avatar_url"
+        ]
+      },
+      "BookingOption": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "amount_minor_units": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "amount_minor_units",
+          "currency"
+        ]
+      },
+      "LocationDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "host_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "address_line1": {
+            "type": "string",
+            "nullable": true
+          },
+          "address_line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string",
+            "nullable": true
+          },
+          "country": {
+            "type": "string"
+          },
+          "postal_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "latitude": {
+            "type": "number",
+            "nullable": true
+          },
+          "longitude": {
+            "type": "number",
+            "nullable": true
+          },
+          "capacity": {
+            "type": "integer",
+            "nullable": true
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "instant_booking_enabled": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "submitted",
+              "under_review",
+              "approved",
+              "published",
+              "rejected",
+              "suspended",
+              "archived"
+            ]
+          },
+          "moderation_reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "suspended_by_host_suspension": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "categories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogRef"
+            }
+          },
+          "amenities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogRef"
+            }
+          },
+          "use_cases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogRef"
+            }
+          },
+          "media": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PublicMediaItem"
+            }
+          },
+          "host": {
+            "$ref": "#/components/schemas/HostPublicSummary"
+          },
+          "booking_options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BookingOption"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "host_id",
+          "title",
+          "description",
+          "address_line1",
+          "address_line2",
+          "city",
+          "region",
+          "country",
+          "postal_code",
+          "latitude",
+          "longitude",
+          "capacity",
+          "timezone",
+          "instant_booking_enabled",
+          "status",
+          "moderation_reason",
+          "suspended_by_host_suspension",
+          "created_at",
+          "updated_at",
+          "categories",
+          "amenities",
+          "use_cases",
+          "media",
+          "host",
+          "booking_options"
+        ]
+      },
+      "NameRef": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "first_name",
+          "last_name"
+        ]
+      },
+      "BookingDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "location": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "title": {
+                "type": "string"
+              },
+              "city": {
+                "type": "string"
+              },
+              "timezone": {
+                "type": "string"
+              },
+              "host_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "host": {
+                "$ref": "#/components/schemas/NameRef"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "city",
+              "timezone",
+              "host_id",
+              "host"
+            ]
+          },
+          "booker_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "booker": {
+            "$ref": "#/components/schemas/NameRef"
+          },
+          "booking_type": {
+            "type": "string",
+            "enum": [
+              "hourly",
+              "half_day",
+              "day",
+              "multi_day"
+            ]
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "requested",
+              "confirmed",
+              "cancelled",
+              "completed",
+              "rejected"
+            ]
+          },
+          "pricing": {
+            "type": "object",
+            "properties": {
+              "base_amount_minor_units": {
+                "type": "integer"
+              },
+              "platform_fee_minor_units": {
+                "type": "integer"
+              },
+              "tax_minor_units": {
+                "type": "integer"
+              },
+              "discount_minor_units": {
+                "type": "integer"
+              },
+              "total_amount_minor_units": {
+                "type": "integer"
+              },
+              "currency": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "base_amount_minor_units",
+              "platform_fee_minor_units",
+              "tax_minor_units",
+              "discount_minor_units",
+              "total_amount_minor_units",
+              "currency"
+            ]
+          },
+          "payments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "amount_minor_units": {
+                  "type": "integer"
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "id",
+                "status",
+                "amount_minor_units",
+                "created_at"
+              ]
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "cancelled_at": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "cancelled_by": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "cancellation_reason": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "location",
+          "booker_id",
+          "booker",
+          "booking_type",
+          "start_at",
+          "end_at",
+          "status",
+          "pricing",
+          "payments",
+          "created_at",
+          "updated_at",
+          "cancelled_at",
+          "cancelled_by",
+          "cancellation_reason"
+        ]
+      },
+      "AdminPaymentDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "booking_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "provider_order_id": {
+            "type": "string"
+          },
+          "provider_reference_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "created",
+              "pending",
+              "success",
+              "failed",
+              "cancelled",
+              "refunded",
+              "partially_refunded"
+            ]
+          },
+          "amount_minor_units": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "failure_reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "booking": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "location_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "booker_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "location": {
+                "type": "object",
+                "nullable": true,
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "title"
+                ]
+              },
+              "booker": {
+                "$ref": "#/components/schemas/NameRef"
+              }
+            },
+            "required": [
+              "id",
+              "location_id",
+              "booker_id",
+              "location",
+              "booker"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "booking_id",
+          "provider",
+          "provider_order_id",
+          "provider_reference_id",
+          "status",
+          "amount_minor_units",
+          "currency",
+          "failure_reason",
+          "created_at",
+          "updated_at",
+          "booking"
+        ]
+      },
+      "AdminRefundDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "payment_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider_refund_id": {
+            "type": "string"
+          },
+          "provider_reference_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "success",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "amount_minor_units": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "payment": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "booking": {
+                "type": "object",
+                "nullable": true,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "location_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "booker_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "location": {
+                    "type": "object",
+                    "nullable": true,
+                    "properties": {
+                      "title": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "title"
+                    ]
+                  },
+                  "booker": {
+                    "$ref": "#/components/schemas/NameRef"
+                  }
+                },
+                "required": [
+                  "id",
+                  "location_id",
+                  "booker_id",
+                  "location",
+                  "booker"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "booking"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "payment_id",
+          "provider_refund_id",
+          "provider_reference_id",
+          "status",
+          "amount_minor_units",
+          "reason",
+          "created_at",
+          "updated_at",
+          "payment"
+        ]
+      },
+      "DeliveryAttemptRow": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "notification_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "device_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "sent",
+              "failed",
+              "invalid_token",
+              "skipped"
+            ]
+          },
+          "provider_message_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "error_reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "notification_id",
+          "device_id",
+          "provider",
+          "status",
+          "provider_message_id",
+          "error_reason",
+          "created_at"
+        ]
+      },
+      "AuditLogEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "admin_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "ADMIN_APPROVED_LOCATION",
+              "ADMIN_REJECTED_LOCATION",
+              "ADMIN_SUSPENDED_LOCATION",
+              "ADMIN_RESTORED_LOCATION",
+              "ADMIN_UPDATED_LOCATION_STATUS",
+              "ADMIN_SUSPENDED_USER",
+              "ADMIN_RESTORED_USER",
+              "ADMIN_CANCELLED_BOOKING",
+              "ADMIN_CREATED_REFUND"
+            ]
+          },
+          "target_type": {
+            "type": "string",
+            "enum": [
+              "location",
+              "user",
+              "booking",
+              "payment"
+            ]
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {
+              "nullable": true
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "admin_id",
+          "action",
+          "target_type",
+          "target_id",
+          "reason",
+          "metadata",
+          "created_at"
+        ]
+      }
+    },
     "parameters": {}
   },
   "paths": {
@@ -42,9 +1068,58 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/DashboardSummary"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Missing/invalid bearer token"
+          },
+          "403": {
+            "description": "Authenticated but not an admin"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/system/status": {
+      "get": {
+        "tags": [
+          "Admin",
+          "System"
+        ],
+        "summary": "Provider/config status -- booleans and enums only, never a credential (Phase 14)",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SystemStatus"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -144,9 +1219,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AdminUserDetail"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }
@@ -198,9 +1299,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/AdminUserDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -273,9 +1377,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/AdminUserDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -340,9 +1447,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/AdminUserDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -377,7 +1487,38 @@
         "parameters": [
           {
             "schema": {
-              "type": "string"
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            },
+            "required": false,
+            "name": "page",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            },
+            "required": false,
+            "name": "pageSize",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "submitted",
+                "under_review",
+                "approved",
+                "published",
+                "rejected",
+                "suspended",
+                "archived"
+              ]
             },
             "required": false,
             "name": "status",
@@ -394,28 +1535,12 @@
           },
           {
             "schema": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
             },
             "required": false,
             "name": "search",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "integer",
-              "nullable": true
-            },
-            "required": false,
-            "name": "page",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "integer",
-              "nullable": true
-            },
-            "required": false,
-            "name": "pageSize",
             "in": "query"
           }
         ],
@@ -428,9 +1553,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/LocationDetail"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }
@@ -456,7 +1607,7 @@
           "Admin",
           "Locations"
         ],
-        "summary": "Location detail (includes moderation_reason)",
+        "summary": "Location detail (includes moderation_reason, suspended_by_host_suspension)",
         "security": [
           {
             "bearerAuth": []
@@ -482,9 +1633,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/LocationDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -549,9 +1703,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/LocationDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -624,9 +1781,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/LocationDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -699,9 +1859,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/LocationDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -766,9 +1929,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/LocationDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -794,7 +1960,7 @@
           "Admin",
           "Bookings"
         ],
-        "summary": "List bookings (booker_id/host_id/location_id/status filters)",
+        "summary": "List bookings (booker_id/host_id/location_id/status/start_after/start_before filters)",
         "security": [
           {
             "bearerAuth": []
@@ -845,6 +2011,24 @@
           },
           {
             "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "required": false,
+            "name": "start_after",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "required": false,
+            "name": "start_before",
+            "in": "query"
+          },
+          {
+            "schema": {
               "type": "integer",
               "minimum": 1,
               "default": 1
@@ -874,9 +2058,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/BookingDetail"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }
@@ -928,9 +2138,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/BookingDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -1001,9 +2214,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/BookingDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -1029,7 +2245,7 @@
           "Admin",
           "Payments"
         ],
-        "summary": "List payments (status/provider/booking_id filters)",
+        "summary": "List payments (status/provider/booking_id/created_after/created_before filters)",
         "security": [
           {
             "bearerAuth": []
@@ -1075,6 +2291,24 @@
           },
           {
             "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "required": false,
+            "name": "created_after",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "required": false,
+            "name": "created_before",
+            "in": "query"
+          },
+          {
+            "schema": {
               "type": "integer",
               "minimum": 1,
               "default": 1
@@ -1104,9 +2338,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AdminPaymentDetail"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }
@@ -1158,9 +2418,12 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "$ref": "#/components/schemas/AdminPaymentDetail"
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -1186,7 +2449,7 @@
           "Admin",
           "Payments"
         ],
-        "summary": "List refunds (status filter)",
+        "summary": "List refunds (status/payment_id filters)",
         "security": [
           {
             "bearerAuth": []
@@ -1205,6 +2468,15 @@
             },
             "required": false,
             "name": "status",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": false,
+            "name": "payment_id",
             "in": "query"
           },
           {
@@ -1238,9 +2510,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AdminRefundDetail"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }
@@ -1315,9 +2613,64 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "payment_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "provider_refund_id": {
+                          "type": "string"
+                        },
+                        "provider_reference_id": {
+                          "type": "string",
+                          "nullable": true
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "pending",
+                            "success",
+                            "failed",
+                            "cancelled"
+                          ]
+                        },
+                        "amount_minor_units": {
+                          "type": "integer"
+                        },
+                        "reason": {
+                          "type": "string",
+                          "nullable": true
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "updated_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "payment_id",
+                        "provider_refund_id",
+                        "provider_reference_id",
+                        "status",
+                        "amount_minor_units",
+                        "reason",
+                        "created_at",
+                        "updated_at"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data"
+                  ]
                 }
               }
             }
@@ -1399,9 +2752,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DeliveryAttemptRow"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }
@@ -1427,7 +2806,7 @@
           "Admin",
           "Audit"
         ],
-        "summary": "Immutable audit log (target_type/target_id/admin_id filters) -- no write endpoint exists",
+        "summary": "Immutable audit log (target_type/target_id/admin_id/action/created_after/created_before filters) -- no write endpoint exists",
         "security": [
           {
             "bearerAuth": []
@@ -1468,6 +2847,43 @@
           },
           {
             "schema": {
+              "type": "string",
+              "enum": [
+                "ADMIN_APPROVED_LOCATION",
+                "ADMIN_REJECTED_LOCATION",
+                "ADMIN_SUSPENDED_LOCATION",
+                "ADMIN_RESTORED_LOCATION",
+                "ADMIN_UPDATED_LOCATION_STATUS",
+                "ADMIN_SUSPENDED_USER",
+                "ADMIN_RESTORED_USER",
+                "ADMIN_CANCELLED_BOOKING",
+                "ADMIN_CREATED_REFUND"
+              ]
+            },
+            "required": false,
+            "name": "action",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "required": false,
+            "name": "created_after",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "required": false,
+            "name": "created_before",
+            "in": "query"
+          },
+          {
+            "schema": {
               "type": "integer",
               "minimum": 1,
               "default": 1
@@ -1497,9 +2913,35 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "nullable": true
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AuditLogEntry"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "pageSize": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "page",
+                        "pageSize",
+                        "total"
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
                 }
               }
             }

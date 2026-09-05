@@ -87,6 +87,15 @@ export async function listAuditLog(supabase: SupabaseClient, query: AuditLogQuer
   if (query.admin_id) {
     request = request.eq("admin_id", query.admin_id);
   }
+  if (query.action) {
+    request = request.eq("action", query.action);
+  }
+  if (query.created_after) {
+    request = request.gte("created_at", query.created_after);
+  }
+  if (query.created_before) {
+    request = request.lte("created_at", query.created_before);
+  }
 
   const { data, error, count } = await request.order("created_at", { ascending: false }).range(from, to);
   if (error) {

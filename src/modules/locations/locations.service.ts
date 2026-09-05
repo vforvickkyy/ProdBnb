@@ -22,7 +22,7 @@ const LOCATION_COLUMNS = `
   id, host_id, title, description,
   address_line1, address_line2, city, region, country, postal_code,
   latitude, longitude, capacity, timezone, instant_booking_enabled,
-  status, moderation_reason, created_at, updated_at
+  status, moderation_reason, suspended_by_host_suspension, created_at, updated_at
 `;
 
 const LOCATION_DETAIL_SELECT = `
@@ -64,6 +64,12 @@ export interface LocationSummary {
   instant_booking_enabled: boolean;
   status: string;
   moderation_reason: string | null;
+  // Only visible to the location's own host or an admin (locations SELECT
+  // RLS restricts a non-published row to those two anyway) -- distinguishes
+  // "your host account was suspended" from "this specific listing was
+  // suspended" so the moderation UI can show the right explanation (Phase
+  // 14; the underlying column and cascade logic are unchanged from Phase 11).
+  suspended_by_host_suspension: boolean;
   created_at: string;
   updated_at: string;
   [key: string]: unknown;

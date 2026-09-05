@@ -3,7 +3,7 @@ import { cancelBooking, getBooking, listBookings } from "../bookings/bookings.se
 import { BookingActionInput, BookingIdParam, ListBookingsQuery } from "../bookings/bookings.schema";
 import { getLocation } from "../locations/locations.service";
 import { LocationIdParam } from "../locations/locations.schema";
-import { createRefund, getPayment } from "../payments/payment.service";
+import { createRefund } from "../payments/payment.service";
 import { CreateRefundInput, PaymentIdParam } from "../payments/payment.schema";
 import {
   AdminListPaymentsQuery,
@@ -19,13 +19,20 @@ import { listAuditLog, writeAuditLog } from "./audit.service";
 import { getDashboardSummary } from "./dashboard.service";
 import { approveLocation, rejectLocation, restoreLocation, suspendLocation } from "./locations.service";
 import { listDeliveryAttempts } from "./notifications.service";
-import { listAllPayments, listAllRefunds } from "./payments.service";
+import { getAdminPayment, listAllPayments, listAllRefunds } from "./payments.service";
+import { getSystemStatus } from "./system.service";
 import { getAdminUserDetail, restoreUser, suspendUser } from "./users.service";
 import { created, ok } from "../../utils/respond";
 
 export async function getDashboard(req: Request, res: Response): Promise<void> {
   const summary = await getDashboardSummary(req.supabase!);
   ok(res, summary);
+}
+
+// -- System ---------------------------------------------------------------
+
+export async function getSystemStatusHandler(_req: Request, res: Response): Promise<void> {
+  ok(res, getSystemStatus());
 }
 
 // -- Users --------------------------------------------------------------
@@ -119,7 +126,7 @@ export async function getAdminPayments(req: Request, res: Response): Promise<voi
 
 export async function getAdminPaymentDetail(req: Request, res: Response): Promise<void> {
   const { id } = req.valid!.params as PaymentIdParam;
-  const payment = await getPayment(req.supabase!, id);
+  const payment = await getAdminPayment(req.supabase!, id);
   ok(res, payment);
 }
 

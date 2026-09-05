@@ -114,18 +114,28 @@ export type BookingActionInput = z.infer<typeof bookingActionSchema>;
 export const bookingIdParamSchema = z.object({ id: uuid });
 export type BookingIdParam = z.infer<typeof bookingIdParamSchema>;
 
-export const listBookingsQuerySchema = z.object({
-  location_id: uuid.optional(),
-  status: bookingStatusSchema.optional(),
-  // Admin-only in practice (RLS already restricts a non-admin's results to
-  // their own rows regardless of these filters being present) — exposed on
-  // the shared schema rather than a separate admin one, since GET
-  // /v1/admin/bookings is a thin wrapper around this same query.
-  booker_id: uuid.optional(),
-  host_id: uuid.optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(20),
-});
+export const listBookingsQuerySchema = z
+  .object({
+    location_id: uuid.optional(),
+    status: bookingStatusSchema.optional(),
+    // Admin-only in practice (RLS already restricts a non-admin's results to
+    // their own rows regardless of these filters being present) — exposed on
+    // the shared schema rather than a separate admin one, since GET
+    // /v1/admin/bookings is a thin wrapper around this same query.
+    booker_id: uuid.optional(),
+    host_id: uuid.optional(),
+    // Filters on the booking's own interval (start_at), not created_at — an
+    // admin asking "what's happening this week" means the booking's actual
+    // date, not when the row was inserted (Phase 14).
+    start_after: offsetDateTime.optional(),
+    start_before: offsetDateTime.optional(),
+    page: z.coerce.number().int().min(1).default(1),
+    pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  })
+  .refine((d) => !d.start_after || !d.start_before || d.start_before >= d.start_after, {
+    message: "start_before must not be earlier than start_after.",
+    path: ["start_before"],
+  });
 export type ListBookingsQuery = z.infer<typeof listBookingsQuerySchema>;
 
 export { bookingTypeSchema };

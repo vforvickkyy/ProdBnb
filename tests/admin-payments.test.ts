@@ -148,6 +148,42 @@ describe("admin: payments & refunds", () => {
       expect(detail.body.data.status).toBe("success");
     });
 
+    it("includes booking/location/booker context, without an email column (Phase 14)", async () => {
+      const { paymentId, bookingId } = await createPaidBooking(host, booker);
+
+      const detail = await request(app).get(`/v1/admin/payments/${paymentId}`).set(authHeader(admin));
+      expect(detail.status).toBe(200);
+      expect(detail.body.data.booking.id).toBe(bookingId);
+      expect(detail.body.data.booking.booker_id).toBe(booker.id);
+      expect(detail.body.data.booking.location.title).toBe("Admin Payment Test Location");
+      expect(detail.body.data.booking.booker).not.toHaveProperty("email");
+
+      const list = await request(app).get("/v1/admin/payments").set(authHeader(admin)).query({ booking_id: bookingId });
+      expect(list.body.data[0].booking.id).toBe(bookingId);
+    });
+
+    it("filters by created_after/created_before, and rejects an inverted range", async () => {
+      const { paymentId } = await createPaidBooking(host, booker);
+
+      const future = await request(app)
+        .get("/v1/admin/payments")
+        .set(authHeader(admin))
+        .query({ created_after: "2099-01-01T00:00:00Z", pageSize: 100 });
+      expect(future.body.data.map((p: { id: string }) => p.id)).not.toContain(paymentId);
+
+      const past = await request(app)
+        .get("/v1/admin/payments")
+        .set(authHeader(admin))
+        .query({ created_after: "2020-01-01T00:00:00Z", pageSize: 100 });
+      expect(past.body.data.map((p: { id: string }) => p.id)).toContain(paymentId);
+
+      const inverted = await request(app)
+        .get("/v1/admin/payments")
+        .set(authHeader(admin))
+        .query({ created_after: "2026-01-01T00:00:00Z", created_before: "2020-01-01T00:00:00Z" });
+      expect(inverted.status).toBe(400);
+    });
+
     it("never leaks the Cashfree secret or raw provider payloads through any admin response", async () => {
       const { paymentId } = await createPaidBooking(host, booker);
       const list = await request(app).get("/v1/admin/payments").set(authHeader(admin));
@@ -189,6 +225,26 @@ describe("admin: payments & refunds", () => {
       const { paymentId } = await createPaidBooking(host, booker);
       const res = await request(app).post(`/v1/admin/payments/${paymentId}/refunds`).set(authHeader(booker)).send({});
       expect(res.status).toBe(403);
+    });
+
+    it("filters refunds by payment_id and includes nested booking context (Phase 14)", async () => {
+      mockState.refundStatus = "success";
+      const { paymentId: ownPaymentId, bookingId } = await createPaidBooking(host, booker);
+      const { paymentId: otherPaymentId } = await createPaidBooking(host, booker);
+
+      const ownRefund = await request(app).post(`/v1/admin/payments/${ownPaymentId}/refunds`).set(authHeader(admin)).send({});
+      const otherRefund = await request(app).post(`/v1/admin/payments/${otherPaymentId}/refunds`).set(authHeader(admin)).send({});
+      expect(ownRefund.status).toBe(201);
+      expect(otherRefund.status).toBe(201);
+
+      const filtered = await request(app)
+        .get("/v1/admin/refunds")
+        .set(authHeader(admin))
+        .query({ payment_id: ownPaymentId, pageSize: 100 });
+      const ids = filtered.body.data.map((r: { id: string }) => r.id);
+      expect(ids).toContain(ownRefund.body.data.id);
+      expect(ids).not.toContain(otherRefund.body.data.id);
+      expect(filtered.body.data[0].payment.booking.id).toBe(bookingId);
     });
   });
 });

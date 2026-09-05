@@ -22,16 +22,43 @@ const BOOKING_COLUMNS = `
   created_at, updated_at
 `;
 
+// Phase 14: admin list/detail views need booker/host identity and whether a
+// payment exists without firing a follow-up request per row -- adding these
+// to the one shared select (rather than a second, admin-only query) keeps
+// exactly one booking-fetching code path, since every non-admin caller is
+// already RLS-restricted to rows they're allowed to see regardless of what
+// extra columns are selected. `profiles` has no email column by design
+// (Phase 1) -- email lookups go through the Admin Auth API on the User
+// detail page instead, not per-row here, which would reintroduce the same
+// N+1 problem this join exists to avoid. `booker:profiles!booker_id` is
+// disambiguated explicitly because `bookings` has two FKs to `profiles`
+// (booker_id and cancelled_by).
 const BOOKING_DETAIL_SELECT = `
   ${BOOKING_COLUMNS},
-  locations ( id, title, city, timezone )
+  locations ( id, title, city, timezone, host_id, host:profiles ( first_name, last_name ) ),
+  booker:profiles!booker_id ( first_name, last_name ),
+  payments ( id, status, amount_minor_units, created_at )
 `;
+
+interface NameRef {
+  first_name: string | null;
+  last_name: string | null;
+}
 
 interface LocationRef {
   id: string;
   title: string;
   city: string;
   timezone: string;
+  host_id: string;
+  host: NameRef | null;
+}
+
+interface PaymentSummary {
+  id: string;
+  status: string;
+  amount_minor_units: number;
+  created_at: string;
 }
 
 interface RawBookingRow {
@@ -54,12 +81,15 @@ interface RawBookingRow {
   created_at: string;
   updated_at: string;
   locations: LocationRef;
+  booker: NameRef | null;
+  payments: PaymentSummary[];
 }
 
 export interface BookingDetail {
   id: string;
   location: LocationRef;
   booker_id: string;
+  booker: NameRef | null;
   booking_type: string;
   start_at: string;
   end_at: string;
@@ -72,6 +102,7 @@ export interface BookingDetail {
     total_amount_minor_units: number;
     currency: string;
   };
+  payments: PaymentSummary[];
   created_at: string;
   updated_at: string;
   cancelled_at: string | null;
@@ -84,6 +115,7 @@ function toBookingDetail(row: RawBookingRow): BookingDetail {
     id: row.id,
     location: row.locations,
     booker_id: row.booker_id,
+    booker: row.booker,
     booking_type: row.booking_type,
     start_at: row.start_at,
     end_at: row.end_at,
@@ -96,6 +128,7 @@ function toBookingDetail(row: RawBookingRow): BookingDetail {
       total_amount_minor_units: row.total_amount_minor_units,
       currency: row.currency,
     },
+    payments: row.payments ?? [],
     created_at: row.created_at,
     updated_at: row.updated_at,
     cancelled_at: row.cancelled_at,
@@ -293,6 +326,12 @@ export async function listBookings(supabase: SupabaseClient, query: ListBookings
   }
   if (query.host_id) {
     request = request.eq("locations.host_id", query.host_id);
+  }
+  if (query.start_after) {
+    request = request.gte("start_at", query.start_after);
+  }
+  if (query.start_before) {
+    request = request.lte("start_at", query.start_before);
   }
 
   const { data, error, count } = await request.order("start_at", { ascending: false }).range(from, to);

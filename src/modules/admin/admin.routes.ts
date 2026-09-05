@@ -24,6 +24,7 @@ import {
   postRestoreUser,
   postSuspendLocation,
   postSuspendUser,
+  getSystemStatusHandler,
 } from "./admin.controller";
 import {
   adminListPaymentsQuerySchema,
@@ -49,6 +50,7 @@ export const adminRouter = Router();
 adminRouter.use(requireAuth, requireRole("admin"));
 
 adminRouter.get("/dashboard", getDashboard);
+adminRouter.get("/system/status", getSystemStatusHandler);
 
 // -- Users --------------------------------------------------------------
 // GET /admin/users already exists (src/modules/users/users.routes.ts,

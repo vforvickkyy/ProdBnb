@@ -137,6 +137,59 @@ describe("admin: bookings", () => {
       await deleteTestUser(otherHost.id);
     });
 
+    it("includes booker/host name and a payment summary, without an email column (Phase 14)", async () => {
+      const locationId = await createBookableLocation(host);
+      const created = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: "2026-10-05T16:00:00Z", end_at: "2026-10-05T17:00:00Z" });
+      expect(created.status).toBe(201);
+
+      await request(app)
+        .post(`/v1/bookings/${created.body.data.id}/payment`)
+        .set(authHeader(booker))
+        .send({ customer_phone: "9876543210" });
+
+      const res = await request(app).get(`/v1/admin/bookings/${created.body.data.id}`).set(authHeader(admin));
+      expect(res.status).toBe(200);
+      expect(res.body.data.location.host_id).toBe(host.id);
+      expect(res.body.data.booker_id).toBe(booker.id);
+      expect(res.body.data.booker).not.toHaveProperty("email");
+      expect(Array.isArray(res.body.data.payments)).toBe(true);
+      expect(res.body.data.payments.length).toBeGreaterThanOrEqual(1);
+      expect(res.body.data.payments[0]).toHaveProperty("status");
+    });
+
+    it("filters by start_after/start_before on the booking's own interval", async () => {
+      const locationId = await createBookableLocation(host);
+      const early = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: "2026-10-12T09:00:00Z", end_at: "2026-10-12T10:00:00Z" });
+      const late = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: "2026-10-12T10:00:00Z", end_at: "2026-10-12T11:00:00Z" });
+      expect(early.status).toBe(201);
+      expect(late.status).toBe(201);
+
+      const res = await request(app)
+        .get("/v1/admin/bookings")
+        .set(authHeader(admin))
+        .query({ location_id: locationId, start_after: "2026-10-12T09:30:00Z", pageSize: 100 });
+      const ids = res.body.data.map((b: { id: string }) => b.id);
+      expect(ids).not.toContain(early.body.data.id);
+      expect(ids).toContain(late.body.data.id);
+    });
+
+    it("rejects start_before earlier than start_after", async () => {
+      const res = await request(app)
+        .get("/v1/admin/bookings")
+        .set(authHeader(admin))
+        .query({ start_after: "2026-10-12T10:00:00Z", start_before: "2026-10-12T09:00:00Z" });
+      expect(res.status).toBe(400);
+    });
+
     it("admin booking detail matches the regular detail endpoint's data", async () => {
       const locationId = await createBookableLocation(host);
       const created = await request(app)

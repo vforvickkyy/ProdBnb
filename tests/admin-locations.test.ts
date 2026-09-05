@@ -262,6 +262,29 @@ describe("admin: locations", () => {
       await deleteTestUser(cascadeHost.id);
     });
 
+    it("exposes suspended_by_host_suspension through the API response, not just the raw DB row (Phase 14)", async () => {
+      const cascadeHost = await createTestUser();
+      await grantRole(cascadeHost, "host");
+      const hostSuspendedLocId = await createPublishedLocation(cascadeHost, admin);
+      const adminSuspendedLocId = await createPublishedLocation(cascadeHost, admin);
+
+      await request(app)
+        .post(`/v1/admin/locations/${adminSuspendedLocId}/suspend`)
+        .set(authHeader(admin))
+        .send({ reason: "Independent content violation." });
+      await request(app).post(`/v1/admin/users/${cascadeHost.id}/suspend`).set(authHeader(admin)).send({ reason: "Host policy violation." });
+
+      const viaAdminDetail = await request(app).get(`/v1/admin/locations/${hostSuspendedLocId}`).set(authHeader(admin));
+      expect(viaAdminDetail.status).toBe(200);
+      expect(viaAdminDetail.body.data.suspended_by_host_suspension).toBe(true);
+
+      const independentViaAdminDetail = await request(app).get(`/v1/admin/locations/${adminSuspendedLocId}`).set(authHeader(admin));
+      expect(independentViaAdminDetail.status).toBe(200);
+      expect(independentViaAdminDetail.body.data.suspended_by_host_suspension).toBe(false);
+
+      await deleteTestUser(cascadeHost.id);
+    });
+
     it("a suspended host's remaining published location cannot receive new bookings", async () => {
       const cascadeHost = await createTestUser();
       await grantRole(cascadeHost, "host");
