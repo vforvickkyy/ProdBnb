@@ -76,6 +76,16 @@ export async function calculateBookingPrice(
   if (bookingType === "hourly") {
     const hours = (new Date(endAt).getTime() - new Date(startAt).getTime()) / 3_600_000;
     baseAmount = Math.round(pricing.amount_minor_units * hours);
+    // Defensive backstop, not the primary guard (that's the 60-minute
+    // minimum in bookings.schema.ts) -- a non-zero rate should never reach
+    // here with an interval short enough to round to 0. If it ever does,
+    // that's an unreachable-invariant bug worth a loud 500, not a silent
+    // free booking.
+    if (pricing.amount_minor_units > 0 && baseAmount === 0) {
+      throw new Error(
+        "Calculated hourly booking amount is 0 despite a non-zero rate -- this should be unreachable given the schema's minimum-duration validation."
+      );
+    }
   } else if (bookingType === "half_day" || bookingType === "day") {
     baseAmount = pricing.amount_minor_units;
   } else {

@@ -51,6 +51,14 @@ const multiDayBookingSchema = z
   })
   .strict();
 
+// Hourly is priced as rate x elapsed time (bookings/pricing.ts) — with no
+// floor on that elapsed time, a short enough interval at a low enough rate
+// rounds to a real ₹0 booking that still consumes a slot. 60 minutes is the
+// smallest unit "hourly" pricing is already denominated in, so it's the
+// natural floor rather than an arbitrary one; fractional hours above it
+// (e.g. 2.5 hours) remain fully supported, unchanged.
+const MIN_HOURLY_DURATION_MS = 60 * 60 * 1000;
+
 // discriminatedUnion requires each member to be a plain ZodObject (so it can
 // inspect the discriminant key directly) — a .refine() wraps a schema in
 // ZodEffects, which breaks that. Cross-field checks that only apply to one
@@ -62,6 +70,15 @@ const bookingUnionSchema = z
     message: "end_at must be after start_at.",
     path: ["end_at"],
   })
+  .refine(
+    (d) =>
+      d.booking_type !== "hourly" ||
+      new Date(d.end_at).getTime() - new Date(d.start_at).getTime() >= MIN_HOURLY_DURATION_MS,
+    {
+      message: "Hourly bookings must be at least 60 minutes long.",
+      path: ["end_at"],
+    }
+  )
   .refine((d) => d.booking_type !== "multi_day" || d.end_date >= d.start_date, {
     message: "end_date must not be before start_date.",
     path: ["end_date"],

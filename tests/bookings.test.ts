@@ -552,6 +552,75 @@ describe("bookings", () => {
     });
   });
 
+  describe("minimum hourly duration (Phase 13D)", () => {
+    it("rejects an hourly booking of only 30 seconds", async () => {
+      const locationId = await createLocation(host);
+      await addRule(locationId, host, "monday", "09:00", "18:00");
+      await addHourlyPricing(locationId, host);
+      await publish(locationId);
+
+      const res = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: `${MON}T09:00:00Z`, end_at: `${MON}T09:00:30Z` });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects an hourly booking of 59 minutes (just below the minimum)", async () => {
+      const locationId = await createLocation(host);
+      await addRule(locationId, host, "monday", "09:00", "18:00");
+      await addHourlyPricing(locationId, host);
+      await publish(locationId);
+
+      const res = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: `${MON}T09:00:00Z`, end_at: `${MON}T09:59:00Z` });
+      expect(res.status).toBe(400);
+    });
+
+    it("accepts an hourly booking of exactly 60 minutes (the minimum)", async () => {
+      const locationId = await createLocation(host);
+      await addRule(locationId, host, "monday", "09:00", "18:00");
+      await addHourlyPricing(locationId, host);
+      await publish(locationId);
+
+      const res = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: `${MON}T09:00:00Z`, end_at: `${MON}T10:00:00Z` });
+      expect(res.status).toBe(201);
+    });
+
+    it("accepts an hourly booking of 61 minutes (just above the minimum)", async () => {
+      const locationId = await createLocation(host);
+      await addRule(locationId, host, "monday", "09:00", "18:00");
+      await addHourlyPricing(locationId, host);
+      await publish(locationId);
+
+      const res = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: `${MON}T09:00:00Z`, end_at: `${MON}T10:01:00Z` });
+      expect(res.status).toBe(201);
+    });
+
+    it("a very low non-zero hourly rate at exactly the minimum duration still produces a non-zero total", async () => {
+      const locationId = await createLocation(host);
+      await addRule(locationId, host, "monday", "09:00", "18:00");
+      await addPricing(locationId, host, { booking_type: "hourly", amount_minor_units: 1 }); // 1 minor unit/hr
+      await publish(locationId);
+
+      const res = await request(app)
+        .post("/v1/bookings")
+        .set(authHeader(booker))
+        .send({ location_id: locationId, start_at: `${MON}T09:00:00Z`, end_at: `${MON}T10:00:00Z` });
+      expect(res.status).toBe(201);
+      expect(res.body.data.pricing.base_amount_minor_units).toBe(1);
+      expect(res.body.data.pricing.total_amount_minor_units).toBe(1);
+    });
+  });
+
   describe("authorization on listing", () => {
     it("a booker only sees their own bookings, a host only sees bookings on their own locations, admin sees all", async () => {
       const locationId = await createLocation(host);
