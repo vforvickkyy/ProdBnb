@@ -76,3 +76,32 @@ export async function postCashfreeWebhook(req: Request, res: Response): Promise<
   await handleWebhook(rawBody, req.headers as Record<string, string | string[] | undefined>);
   res.status(200).json({ received: true });
 }
+
+/**
+ * Where a provider redirects a payer's browser when a hosted/web checkout
+ * finishes (Phase 26-H). Serves a neutral, self-contained page and nothing
+ * else: it asserts no outcome, because arriving here proves only that a
+ * redirect happened -- not that any money moved.
+ *
+ * The native iOS SDK flow never lands here; it reconciles through
+ * POST /v1/payments/:id/verify instead. This exists so the default
+ * `return_url` handed to the provider resolves to something coherent rather
+ * than a 401 JSON error page.
+ */
+export function getPaymentReturn(_req: Request, res: Response): void {
+  res
+    .status(200)
+    .type("html")
+    .send(
+      `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+        `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+        `<title>Payment complete</title>` +
+        `<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;` +
+        `font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;` +
+        `background:#f7f7f5;color:#1c1c1e;text-align:center;padding:24px}` +
+        `main{max-width:22rem}h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;color:#6b6b70}` +
+        `@media(prefers-color-scheme:dark){body{background:#111113;color:#f2f2f7}p{color:#9b9ba1}}</style>` +
+        `</head><body><main><h1>You can return to Prod.Bnb</h1>` +
+        `<p>Your booking and payment status will be confirmed in the app.</p></main></body></html>`
+    );
+}

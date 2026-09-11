@@ -701,8 +701,26 @@ differently-shaped `checkout` object, not this same one.
   silently ignored), or the booking isn't in a payable status (`cancelled`/`rejected`/`completed`).
 - `403 FORBIDDEN` — the caller can see the booking (e.g. its host) but isn't its booker.
 - `404 NOT_FOUND` — the booking doesn't exist or isn't visible to the caller at all.
-- `409 CONFLICT` — a payment is already in progress (`created`/`pending`) for this booking; wait
-  for it to resolve or verify it before starting another.
+- `409 CONFLICT` — the booking has already been paid for, or a payment is in progress whose
+  provider order could not be reached right now (so a second order cannot safely be created).
+
+**Resume-or-create (Phase 26-H).** Calling this endpoint again while an attempt is already
+in flight no longer fails. The server asks the provider what actually happened to that order and:
+
+- order still payable → returns the **same** `payment_id` and the **same** `checkout.order_id`
+  with a **freshly minted** `checkout.payment_session_id`. This is a resume, not a second charge:
+  exactly one provider order ever exists per attempt.
+- order already paid → reconciles the payment to `success` first, then returns `409`.
+- order expired/terminated → records that attempt terminally and creates a genuinely new one
+  (a new `payment_id`; attempt history is preserved, never overwritten).
+
+This makes the endpoint safe to retry after an ambiguous network failure, and is what stops an
+abandoned checkout from permanently blocking a booking from ever being paid. The client must
+still never retry automatically in a loop — `paymentCreationLimiter` (10 / 15 min / user) applies.
+
+Before any payment is allowed to become `success`, the amount and currency the provider reports
+are checked against `payments.amount_minor_units`/`currency`. A mismatch is recorded as `failed`
+with the discrepancy captured server-side, never as a successful payment.
 
 ### `GET /v1/bookings/:id/payments`
 
@@ -721,6 +739,17 @@ directly against Cashfree's own API — never trusts a client's "it succeeded" c
 (returns the current record unchanged) once the payment has already reached a terminal status
 (`success`/`failed`/`cancelled`/`refunded`/`partially_refunded`).
 
+**Attempt-level reconciliation (Phase 26-H.9D).** For an order the provider still reports as open,
+the server additionally reads that order's individual payment *attempts*. A **successful** attempt
+settles the payment immediately — subject to the same amount/currency verification — rather than
+waiting for order-level status or a webhook.
+
+An **unsuccessful** attempt (failed, abandoned, cancelled, voided) deliberately changes nothing:
+the provider allows another attempt inside the same still-open order, so the payment stays
+`pending` and resumable. A failed attempt is not a failed payment, and treating it as one would
+permanently block a later success on that order. No attempt detail is exposed through this or any
+other endpoint.
+
 ### `POST /v1/payments/:id/refunds`
 
 Requires authentication **and** the `admin` role (hosts have no payout/fund-split mechanism yet —
@@ -737,11 +766,23 @@ Response (`201`): the created refund record.
 
 Requires authentication, RLS-scoped list.
 
+### `GET /v1/payments/return`
+
+No authentication — this is where a provider redirects a payer's **browser** after a hosted/web
+checkout completes, and it is the default `return_url` sent with every created order. Serves a
+neutral HTML page and deliberately asserts no outcome: arriving here proves only that a redirect
+happened, not that any money moved. The native iOS SDK flow never lands here; it reconciles via
+`POST /v1/payments/:id/verify`. Registered ahead of `GET /v1/payments/:id` so it isn't matched as
+`:id = "return"` (Phase 26-H).
+
 ### `POST /v1/payments/webhooks/cashfree`
 
 No authentication — Cashfree has no bearer token to send; the webhook's own HMAC-SHA256 signature
 (`x-webhook-timestamp` + `x-webhook-signature` headers, verified against the exact raw request
-body) is the authentication. Not callable meaningfully by anything other than Cashfree itself —
+body) is the authentication. A `PAYMENT_USER_DROPPED_WEBHOOK` additionally terminates the
+still-payable provider order before recording a terminal `failed`, so ProdBnb never treats a live,
+payable order as dead (Phase 26-H); a plain `PAYMENT_FAILED_WEBHOOK` deliberately does not, since
+the payer is likely still in checkout retrying. Not callable meaningfully by anything other than Cashfree itself —
 an invalid or missing signature is rejected before any database write. See
 [`docs/DATABASE.md`](DATABASE.md#raw-body--signature-verification) for the raw-body handling
 detail and the idempotency/out-of-order-safety guarantees.

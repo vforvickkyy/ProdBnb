@@ -5,6 +5,7 @@ import { validate } from "../../middleware/validate";
 import { bookingIdParamSchema } from "../bookings/bookings.schema";
 import {
   getPaymentDetail,
+  getPaymentReturn,
   getPaymentsForBooking,
   getRefundsForPayment,
   postPayment,
@@ -30,6 +31,17 @@ paymentsRouter.post(
 );
 
 paymentsRouter.get("/bookings/:id/payments", requireAuth, validate({ params: bookingIdParamSchema }), getPaymentsForBooking);
+
+// Registered BEFORE "/payments/:id" -- Express matches in order, so without
+// this the path would bind `:id = "return"` and answer a returning payer's
+// BROWSER with a 401 JSON body (Phase 26-H fix). Deliberately unauthenticated:
+// whoever lands here arrived via a provider redirect, not with a bearer token.
+//
+// Carries no payment state and reads no query parameter, because a provider
+// redirect is not evidence of anything -- the native SDK path never depends on
+// this route, and payment truth only ever comes from a signed webhook or a
+// server-side verify.
+paymentsRouter.get("/payments/return", getPaymentReturn);
 
 paymentsRouter.get("/payments/:id", requireAuth, validate({ params: paymentIdParamSchema }), getPaymentDetail);
 

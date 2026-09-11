@@ -7,7 +7,7 @@ import { getBooking } from "../bookings/bookings.service";
 import { notifyPaymentFailed, notifyPaymentSuccess, notifyRefundProcessed } from "../notifications/notification.service";
 import { CreatePaymentInput, CreateRefundInput } from "./payment.schema";
 import { getPaymentProvider } from "./providers";
-import { NormalizedPaymentStatus, NormalizedWebhookEvent } from "./providers/PaymentProvider";
+import { FetchOrderResult, NormalizedPaymentStatus, NormalizedWebhookEvent } from "./providers/PaymentProvider";
 
 const UNIQUE_VIOLATION = "23505";
 
@@ -68,21 +68,136 @@ async function getBookerId(bookingId: string): Promise<string | null> {
   return data?.booker_id ?? null;
 }
 
+/** The minimum a payment row must expose for a guarded status transition. */
+interface PaymentStatusTarget {
+  id: string;
+  status: string;
+  amount_minor_units: number;
+  currency: string;
+}
+
+/** What the provider itself claims the money was; `null` fields mean "not reported". */
+export interface ProviderReportedAmount {
+  amountMinorUnits: number | null;
+  currency: string | null;
+}
+
+/**
+ * Phase 26-H. The provider is the one telling us a payment succeeded, so before
+ * that claim is allowed to become a `success` row we check it is a claim about
+ * the amount we actually recorded. A provider reporting a different amount or
+ * currency than `payments.amount_minor_units`/`currency` is never recorded as
+ * success -- it becomes a `failed` with the discrepancy captured internally.
+ *
+ * A `null` reported value means the provider did not include it on this
+ * particular event, which is not evidence of a mismatch and so is not treated
+ * as one. This check is defence-in-depth: the amount ProdBnb *charges* is
+ * already structurally un-influenceable by any client (createPayment reads it
+ * only from the booking's own immutable snapshot).
+ */
+function amountMismatchReason(expected: PaymentStatusTarget, reported: ProviderReportedAmount | null): string | null {
+  if (!reported) {
+    return null;
+  }
+  if (reported.amountMinorUnits != null && reported.amountMinorUnits !== expected.amount_minor_units) {
+    return `Provider reported ${reported.amountMinorUnits} minor units but this payment is for ${expected.amount_minor_units}.`;
+  }
+  if (reported.currency != null && reported.currency.toUpperCase() !== expected.currency.toUpperCase()) {
+    return `Provider reported currency ${reported.currency.toUpperCase()} but this payment is in ${expected.currency.toUpperCase()}.`;
+  }
+  return null;
+}
+
+/**
+ * Turns a provider order read into the status this payment should move to (Phase 26-H.9D).
+ *
+ * One place, used by both the verify and the resume path, so attempt-level data can never mean
+ * two different things depending on how it was fetched. It does **not** transition anything --
+ * `applyPaymentStatusUpdate` remains the only funnel that writes status.
+ *
+ * Two rules carry the whole design:
+ *
+ * 1. **A successful attempt can settle an order the provider still reports as open.** Money
+ *    demonstrably moved; waiting for order-level `PAID` or a webhook that may never arrive only
+ *    delays the truth.
+ * 2. **An unsuccessful attempt changes nothing.** While the order is open the payer may attempt
+ *    again -- Cashfree's own reference shows one order carrying a failed *and* a successful
+ *    attempt -- so a failed attempt is not a failed payment. Since `failed` is terminal here, the
+ *    naive mapping would permanently lock out a later success on that same order. That is the
+ *    single most important invariant in this phase.
+ */
+function effectiveProviderOutcome(
+  result: FetchOrderResult,
+  current: PaymentStatusTarget
+): { status: NormalizedPaymentStatus; reported: ProviderReportedAmount; raw: unknown } {
+  const attemptSummary =
+    result.settledAttempt || result.lastAttempt
+      ? { settledAttempt: result.settledAttempt ?? null, lastAttempt: result.lastAttempt ?? null }
+      : null;
+
+  // Audit trail keeps the reduced attempt projection alongside the order body. Never exposed:
+  // `provider_raw` is excluded from PAYMENT_COLUMNS, so no API response can carry it.
+  const raw = attemptSummary ? { order: result.raw, attempts: attemptSummary } : result.raw;
+
+  const settled = result.settledAttempt;
+  if (result.status === "pending" && settled && settled.status === "success") {
+    // Validate the SUCCESS attempt against OUR recorded amount before letting it settle anything.
+    //
+    // Checked here rather than left to the funnel on purpose: the funnel turns a mismatched
+    // success into a terminal `failed`, which would be exactly wrong for an order that is still
+    // open and still payable. A mismatch must leave the payment pending and resumable.
+    const mismatch = amountMismatchReason(current, {
+      amountMinorUnits: settled.amountMinorUnits,
+      currency: settled.currency,
+    });
+    if (mismatch) {
+      console.error(`Cashfree attempt amount/currency mismatch for payment ${current.id}; not settling. ${mismatch}`);
+      return { status: result.status, reported: { amountMinorUnits: null, currency: null }, raw };
+    }
+    return {
+      status: "success",
+      reported: { amountMinorUnits: settled.amountMinorUnits, currency: settled.currency },
+      raw,
+    };
+  }
+
+  return {
+    status: result.status,
+    reported: { amountMinorUnits: result.amountMinorUnits, currency: result.currency },
+    raw,
+  };
+}
+
 async function applyPaymentStatusUpdate(
-  paymentId: string,
-  currentStatus: string,
+  current: PaymentStatusTarget,
   incomingStatus: NormalizedPaymentStatus,
   providerReferenceId: string | null,
   raw: unknown,
-  failureReason: string | null
+  failureReason: string | null,
+  reportedAmount: ProviderReportedAmount | null = null
 ): Promise<PaymentDetail> {
-  const resolved = nextPaymentStatus(currentStatus, incomingStatus);
+  const paymentId = current.id;
+  const currentStatus = current.status;
+  let resolved = nextPaymentStatus(currentStatus, incomingStatus);
+  let resolvedFailureReason = failureReason;
+
+  // Only guard a genuine transition INTO success. An already-terminal payment
+  // is returned untouched by nextPaymentStatus above, and a late, malformed
+  // event must never be able to flip an already-successful payment to failed.
+  if (resolved === "success" && resolved !== currentStatus) {
+    const mismatch = amountMismatchReason(current, reportedAmount);
+    if (mismatch) {
+      resolved = "failed";
+      resolvedFailureReason = `Amount/currency mismatch. ${mismatch}`;
+    }
+  }
+
   const patch: Record<string, unknown> = { status: resolved, provider_raw: raw };
   if (providerReferenceId) {
     patch.provider_reference_id = providerReferenceId;
   }
-  if (resolved === "failed" && failureReason) {
-    patch.failure_reason = failureReason;
+  if (resolved === "failed" && resolvedFailureReason) {
+    patch.failure_reason = resolvedFailureReason;
   }
 
   const { data, error } = await adminClient.from("payments").update(patch).eq("id", paymentId).select(PAYMENT_COLUMNS).single();
@@ -110,11 +225,90 @@ async function applyPaymentStatusUpdate(
 }
 
 /**
+ * Decides what to do with an existing `created`/`pending` payment (Phase 26-H).
+ *
+ * Returns the payload to hand straight back to the caller when the provider
+ * order is still payable -- the SAME payment row and the SAME provider order,
+ * with a freshly-minted checkout session. That is what makes
+ * `POST /v1/bookings/:id/payment` naturally idempotent: a retry after an
+ * ambiguous network failure resumes rather than creating a second order, so a
+ * booking can never accumulate two live orders and a payer can never be
+ * charged twice.
+ *
+ * Returns `null` when the old attempt is genuinely dead -- having first
+ * recorded that terminal outcome, which frees the one-in-flight index so the
+ * caller can start a clean new attempt (a new row, preserving attempt history).
+ *
+ * Throws when the situation is not ours to resolve: already paid, or the
+ * provider is unreachable and we therefore cannot tell.
+ */
+async function resumeInFlightPayment(
+  inFlight: PaymentDetail
+): Promise<{ payment: PaymentDetail; checkout: Record<string, unknown> } | null> {
+  const provider = getPaymentProvider();
+
+  let order;
+  try {
+    order = await provider.fetchOrder(inFlight.provider_order_id);
+  } catch {
+    // We cannot see whether the existing order is still live, so we must not
+    // create a second one -- that is precisely the duplicate-charge risk this
+    // whole path exists to remove. Preserve the pre-26-H conflict semantics.
+    throw new ConflictError("A payment is already in progress for this booking. Please try again in a moment.");
+  }
+
+  // Same interpretation the verify path uses (Phase 26-H.9D), so a resume and a verify can never
+  // disagree about what the provider just said.
+  const outcome = effectiveProviderOutcome(order, inFlight);
+
+  if (outcome.status === "success") {
+    // Either the order itself is paid, or an attempt against it succeeded and we simply hadn't
+    // heard yet. Record that before refusing, so the caller's next read sees the truth.
+    await applyPaymentStatusUpdate(inFlight, "success", order.providerReferenceId, outcome.raw, null, outcome.reported);
+    throw new ConflictError("This booking has already been paid for.");
+  }
+
+  if (outcome.status === "pending") {
+    const { data, error } = await adminClient
+      .from("payments")
+      .update({
+        status: "pending",
+        provider_reference_id: order.providerReferenceId ?? inFlight.provider_reference_id,
+        provider_raw: order.raw,
+      })
+      .eq("id", inFlight.id)
+      .select(PAYMENT_COLUMNS)
+      .single();
+    if (error || !data) {
+      throw error ?? new Error("Failed to update payment while resuming.");
+    }
+    return { payment: data as PaymentDetail, checkout: order.checkout };
+  }
+
+  // failed / cancelled / expired at the provider: settle this attempt so the
+  // partial unique index lets a genuinely new one be created.
+  // EXPIRED / TERMINATED only. Reached solely from order-level status: an unsuccessful *attempt*
+  // never lands here, because an open order stays `pending` above and remains resumable.
+  await applyPaymentStatusUpdate(
+    inFlight,
+    outcome.status,
+    order.providerReferenceId,
+    outcome.raw,
+    "The previous payment attempt is no longer completable.",
+    outcome.reported
+  );
+  return null;
+}
+
+/**
  * Only the booker themselves may pay for their own booking, only while it's
  * still `requested`/`confirmed` (Phase 6A statuses, unmodified -- payment
  * never adds a new one). The booking's own immutable price snapshot
  * (`bookings.total_amount_minor_units`/`currency`) is the sole amount
  * source -- nothing here reads or trusts any client-supplied amount.
+ *
+ * Phase 26-H: an in-flight attempt is resumed rather than rejected -- see
+ * `resumeInFlightPayment`. Booking status is still never touched here.
  */
 export async function createPayment(
   supabase: SupabaseClient,
@@ -131,9 +325,16 @@ export async function createPayment(
     throw new ValidationError(`Cannot create a payment for a booking with status '${booking.status}'.`);
   }
 
+  // Phase 26-H: an existing in-flight attempt is RESUMED, not rejected.
+  //
+  // Before this, an abandoned checkout left a `pending` payment that only a
+  // webhook could ever settle -- and if that webhook never arrived, every
+  // retry hit a 409 forever and the booker could not pay for their booking at
+  // all. The provider order is the source of truth for whether that attempt is
+  // still live, so we ask it rather than guessing from our own row.
   const { data: inFlight, error: inFlightError } = await adminClient
     .from("payments")
-    .select("id")
+    .select(PAYMENT_COLUMNS)
     .eq("booking_id", bookingId)
     .in("status", ["created", "pending"])
     .maybeSingle();
@@ -141,7 +342,13 @@ export async function createPayment(
     throw inFlightError;
   }
   if (inFlight) {
-    throw new ConflictError("A payment is already in progress for this booking.");
+    const resumed = await resumeInFlightPayment(inFlight as PaymentDetail);
+    if (resumed) {
+      return resumed;
+    }
+    // Not resumable: the attempt has been settled terminally above, which also
+    // releases payments_one_inflight_per_booking, so a fresh attempt may now be
+    // created below.
   }
 
   // Payment success deliberately never mutates booking status (Phase 7), so
@@ -270,8 +477,9 @@ export async function verifyPayment(supabase: SupabaseClient, paymentId: string)
   }
 
   const provider = getPaymentProvider();
-  const result = await provider.fetchOrderStatus(current.provider_order_id);
-  return applyPaymentStatusUpdate(current.id, current.status, result.status, result.providerReferenceId, result.raw, null);
+  const result = await provider.fetchOrder(current.provider_order_id);
+  const outcome = effectiveProviderOutcome(result, current);
+  return applyPaymentStatusUpdate(current, outcome.status, result.providerReferenceId, outcome.raw, null, outcome.reported);
 }
 
 async function recomputePaymentRefundStatus(paymentId: string): Promise<void> {
@@ -472,7 +680,7 @@ export async function handleWebhook(rawBody: string, headers: Record<string, str
 
   const { data: payment, error: paymentError } = await adminClient
     .from("payments")
-    .select("id, status")
+    .select("id, status, amount_minor_units, currency, provider_order_id")
     .eq("provider_order_id", event.providerOrderId)
     .maybeSingle();
   if (paymentError) {
@@ -481,13 +689,36 @@ export async function handleWebhook(rawBody: string, headers: Record<string, str
 
   if (payment) {
     const incoming: NormalizedPaymentStatus = event.type === "PAYMENT_SUCCESS" ? "success" : "failed";
+
+    // Phase 26-H. The payer abandoned checkout, so the provider order is still
+    // ACTIVE and payable while we are about to record a TERMINAL `failed` that
+    // can never be walked back. Left alone, someone completing that still-live
+    // order later would be charged against a payment we consider dead forever.
+    // Terminating first makes our `failed` true at the provider too.
+    //
+    // Deliberately NOT done for a plain PAYMENT_FAILED (e.g. a card decline):
+    // there the payer is very likely still in checkout about to try another
+    // instrument, and killing their order mid-session would break a payment
+    // that was about to succeed.
+    if (event.type === "PAYMENT_USER_DROPPED" && !TERMINAL_PAYMENT_STATUSES.has(payment.status)) {
+      try {
+        await getPaymentProvider().terminateOrder(payment.provider_order_id);
+      } catch (err) {
+        // Non-fatal by contract: the provider legitimately refuses to terminate
+        // an order that was in fact just paid. Acknowledging the webhook still
+        // matters more than this best-effort cleanup, and the guarded status
+        // transition below plus reconciliation remain correct either way.
+        console.error("Failed to terminate abandoned Cashfree order:", err);
+      }
+    }
+
     await applyPaymentStatusUpdate(
-      payment.id,
-      payment.status,
+      payment,
       incoming,
       event.providerPaymentId,
       event.raw,
-      incoming === "failed" ? "Payment failed or was not completed." : null
+      incoming === "failed" ? "Payment failed or was not completed." : null,
+      { amountMinorUnits: event.amountMinorUnits, currency: event.currency }
     );
     await adminClient.from("payment_webhook_events").update({ payment_id: payment.id }).eq("id", ledgerRow.id);
   }

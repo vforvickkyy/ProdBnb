@@ -47,9 +47,92 @@ export interface CreateOrderResult {
   raw: unknown;
 }
 
-export interface FetchOrderStatusResult {
+/**
+ * One payment *attempt* against an order, in provider-neutral terms (Phase 26-H.9D).
+ *
+ * An order and an attempt are different things. A provider order is the thing being paid for and
+ * stays open until it is paid, expires or is terminated; an attempt is one try at paying it. A
+ * single order legitimately carries several attempts -- a failed card, then a successful UPI --
+ * which is why an attempt failing says nothing final about the order.
+ */
+export type ProviderAttemptStatus =
+  | "success"
+  | "pending"
+  | "failed"
+  /** The payer abandoned this attempt without completing it. */
+  | "dropped"
+  | "cancelled"
+  | "void"
+  /** The provider created an attempt record but nothing was ever tried against it. */
+  | "notAttempted"
+  /** A value this build does not recognise. Never coerced into a known one. */
+  | "unknown";
+
+/**
+ * The **reduced projection** of an attempt that crosses into the generic layer.
+ *
+ * Deliberately narrow (Phase 26-H.9D): a real provider attempt payload also carries instrument
+ * data -- card BIN and last four, network, bank, UPI handle, gateway details, authorization -- and
+ * none of that is needed to reconcile a payment. Keeping it out of this type is what keeps it out
+ * of the database and the logs.
+ */
+export interface ProviderAttempt {
+  /** The provider's own id for this attempt (Cashfree's `cf_payment_id`). */
+  id: string | null;
+  status: ProviderAttemptStatus;
+  /** The provider's raw status string, kept only so an unrecognised value is diagnosable. */
+  rawStatus: string | null;
+  amountMinorUnits: number | null;
+  currency: string | null;
+  /** ISO-8601, as the provider reported it. */
+  attemptedAt: string | null;
+  completedAt: string | null;
+  /** e.g. "upi", "debit_card" -- coarse method family, never instrument detail. */
+  method: string | null;
+  /** Provider error code, for diagnostics. Never shown to a payer verbatim. */
+  errorCode: string | null;
+  errorDescription: string | null;
+}
+
+export interface FetchOrderResult {
   status: NormalizedPaymentStatus;
   providerReferenceId: string | null;
+  /**
+   * A **fresh** provider-shaped checkout payload for this same order -- the
+   * thing that makes resuming an abandoned attempt possible without creating a
+   * second order (Phase 26-H). For Cashfree the provider re-issues a new
+   * `payment_session_id` on every order fetch; it is a different token each
+   * time but addresses the identical order, so handing it back is a resume,
+   * never a duplicate charge.
+   *
+   * Only meaningful while the order is still payable (`pending`).
+   */
+  checkout: Record<string, unknown>;
+  /**
+   * What the PROVIDER says this order is for, used to verify against what
+   * ProdBnb recorded before any payment is allowed to reach `success`
+   * (Phase 26-H). `null` when the provider does not report it -- which for a
+   * real provider response it always does; see `assertProviderAmountMatches`.
+   */
+  amountMinorUnits: number | null;
+  currency: string | null;
+  /**
+   * A successful attempt found against an order the provider still reports as open
+   * (Phase 26-H.9D). Lets a payment settle from the strongest available evidence rather than
+   * waiting for order-level status or a webhook that may never arrive.
+   *
+   * **Optional on purpose:** a provider that does not expose attempts, and every existing test
+   * double, simply omits it and behaves exactly as before.
+   */
+  settledAttempt?: ProviderAttempt | null;
+  /**
+   * The most recent attempt worth *explaining* when the order is still open and unpaid --
+   * typically a failed or abandoned try.
+   *
+   * Advisory only. It must never drive a status transition: while the order is still open the
+   * payer can attempt again, so a failed attempt is not a failed payment.
+   */
+  lastAttempt?: ProviderAttempt | null;
   raw: unknown;
 }
 
@@ -71,6 +154,16 @@ export type NormalizedWebhookEventType =
   | "PAYMENT_PENDING"
   | "PAYMENT_SUCCESS"
   | "PAYMENT_FAILED"
+  /**
+   * The payer abandoned checkout without completing. Distinguished from
+   * `PAYMENT_FAILED` (Phase 26-H) for one reason only: the payer has left, so
+   * the still-payable provider order can be safely terminated before ProdBnb
+   * records a terminal `failed` -- see `payment.service.ts#handleWebhook`.
+   * A `PAYMENT_FAILED` (e.g. a card decline) means the payer is very likely
+   * still sitting in checkout about to try another instrument, so that one is
+   * deliberately NOT terminated.
+   */
+  | "PAYMENT_USER_DROPPED"
   | "REFUND_CREATED"
   | "REFUND_SUCCESS"
   | "REFUND_FAILED";
@@ -81,6 +174,8 @@ export interface NormalizedWebhookEvent {
   providerPaymentId: string | null;
   providerRefundId: string | null;
   amountMinorUnits: number | null;
+  /** ISO-4217 code the provider reports for this event, when it reports one. */
+  currency: string | null;
   raw: unknown;
 }
 
@@ -92,7 +187,22 @@ export interface VerifyWebhookInput {
 export interface PaymentProvider {
   readonly name: PaymentProviderName;
   createOrder(input: CreateOrderInput): Promise<CreateOrderResult>;
-  fetchOrderStatus(providerOrderId: string): Promise<FetchOrderStatusResult>;
+  /**
+   * The authoritative server-side read of an order: its status, what the
+   * provider believes it is for, and a fresh checkout payload for resuming it.
+   * Replaces Phase 7's `fetchOrderStatus` (Phase 26-H) -- one call now answers
+   * "did this succeed", "for how much" and "can the payer resume", instead of
+   * needing a separate round-trip for each.
+   */
+  fetchOrder(providerOrderId: string): Promise<FetchOrderResult>;
+  /**
+   * Makes an abandoned order genuinely unpayable, so ProdBnb recording a
+   * terminal `failed` is not a lie about a provider order that is still live
+   * (Phase 26-H). Best-effort by contract: callers must tolerate it throwing,
+   * since a provider may legitimately refuse (e.g. the order was in fact just
+   * paid), and reconciliation is what settles that -- not this call.
+   */
+  terminateOrder(providerOrderId: string): Promise<void>;
   createRefund(input: CreateRefundInput): Promise<RefundResult>;
   /**
    * Verifies the provider's signature and normalizes the event. Throws an

@@ -4,14 +4,19 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 // Mirrors tests/payments.test.ts's mocking approach exactly.
 const mockState = vi.hoisted(() => ({
   orderStatus: new Map<string, "pending" | "success" | "failed">(),
+  orderAmounts: new Map<string, { amountMinorUnits: number; currency: string }>(),
   refundStatus: "success" as "pending" | "success" | "failed",
 }));
 
 vi.mock("../src/modules/payments/providers/CashfreeProvider", () => ({
   CashfreeProvider: class {
     name = "cashfree" as const;
-    async createOrder(input: { merchantOrderId: string }) {
+    async createOrder(input: { merchantOrderId: string; amountMinorUnits: number; currency: string }) {
       mockState.orderStatus.set(input.merchantOrderId, "pending");
+      mockState.orderAmounts.set(input.merchantOrderId, {
+        amountMinorUnits: input.amountMinorUnits,
+        currency: input.currency,
+      });
       return {
         providerReferenceId: `cf_${input.merchantOrderId}`,
         status: "pending" as const,
@@ -19,9 +24,22 @@ vi.mock("../src/modules/payments/providers/CashfreeProvider", () => ({
         raw: { mocked: true, secret_should_not_leak: "SHOULD_NOT_APPEAR" },
       };
     }
-    async fetchOrderStatus(providerOrderId: string) {
+    async fetchOrder(providerOrderId: string) {
       const status = mockState.orderStatus.get(providerOrderId) ?? "pending";
-      return { status, providerReferenceId: `cf_${providerOrderId}`, raw: { mocked: true } };
+      const recorded = mockState.orderAmounts.get(providerOrderId);
+      return {
+        status,
+        providerReferenceId: `cf_${providerOrderId}`,
+        checkout: { payment_session_id: `session_${providerOrderId}`, order_id: providerOrderId },
+        // Reports what was actually recorded, so Phase 26-H's amount/currency
+        // verification passes exactly as it does against the real provider.
+        amountMinorUnits: recorded?.amountMinorUnits ?? null,
+        currency: recorded?.currency ?? null,
+        raw: { mocked: true },
+      };
+    }
+    async terminateOrder(providerOrderId: string) {
+      mockState.orderStatus.set(providerOrderId, "cancelled");
     }
     async createRefund(input: { merchantRefundId: string }) {
       return { providerReferenceId: `cf_${input.merchantRefundId}`, status: mockState.refundStatus, raw: { mocked: true } };

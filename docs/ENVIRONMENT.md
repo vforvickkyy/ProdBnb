@@ -16,7 +16,7 @@ variable before the first deploy, not after.
 | `PORT` | not used on Vercel | local dev only | n/a (Vercel manages this) | n/a (Vercel manages this) |
 | `NODE_ENV` | server-only | `development` | `production` | `production` |
 | `CORS_ORIGINS` | server-only | local dev value | `https://staging-admin.prodbnb.com` | `https://admin.prodbnb.com` |
-| `API_BASE_URL` | server-only, **highest-risk value** | unchanged | `https://staging-api.prodbnb.com` | `https://api.prodbnb.com` |
+| `API_BASE_URL` | server-only, **highest-risk value** | unchanged | `https://prodbnb-backend-staging.vercel.app` | **not configured yet** — no production backend exists |
 | `SUPABASE_URL` | public-safe | existing project | new staging project | new prod project |
 | `SUPABASE_ANON_KEY` | public-safe | existing | new | new |
 | `SUPABASE_SERVICE_ROLE_KEY` | **secret** | existing | new | new |
@@ -42,6 +42,13 @@ reach the webhook, so payments silently never reconcile. There is no error, no l
 health check — just payments that stay `pending` forever. Set it explicitly for every deployed
 environment and verify with a real webhook round-trip, not just "the deploy succeeded."
 
+The **current staging value is `https://prodbnb-backend-staging.vercel.app`** — the live Vercel
+deployment URL for the `prodbnb-backend-staging` project. Use exactly that. A `prodbnb.com`
+hostname is *not* a valid value today: that domain is not registered and does not resolve, so
+`API_BASE_URL` pointed at one produces a `notify_url` Cashfree can never deliver to — the precise
+silent failure described above. **Production is not configured yet**; there is no production
+backend, project, or domain, so there is no production value to set.
+
 ## Admin Panel
 
 All three variables are `NEXT_PUBLIC_*` — public-safe by design (the same reasoning as shipping a
@@ -53,7 +60,7 @@ existing build.
 |---|---|---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | existing project | new staging project | new prod project |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | existing | new | new |
-| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:4000` | `https://staging-api.prodbnb.com` | `https://api.prodbnb.com` |
+| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:4000` | `https://prodbnb-backend-staging.vercel.app` | **not configured yet** — no production backend exists |
 
 ## What must never reach the Admin Panel, any client, or Git
 

@@ -99,7 +99,13 @@ describe("payment webhooks (Cashfree)", () => {
   let host: TestUser;
   let booker: TestUser;
   let locationId: string;
-  let nextHour = 9; // 2026-10-05 (a Monday) has an open 09:00-18:00 window
+  // Slots are allocated 09:00-18:00 on consecutive Mondays. One Monday only
+  // holds nine one-hour bookings, so the counter rolls into the next Monday
+  // rather than silently running past the availability window (which the
+  // booking engine correctly rejects with a 400).
+  const MONDAYS = ["2026-10-05", "2026-10-12", "2026-10-19", "2026-10-26"];
+  const SLOTS_PER_MONDAY = 9; // 09:00 through 17:00 inclusive
+  let slotIndex = 0;
 
   beforeAll(async () => {
     host = await createTestUser();
@@ -134,9 +140,14 @@ describe("payment webhooks (Cashfree)", () => {
    * booking across tests would make those collide with each other.
    */
   async function createFreshBooking(): Promise<string> {
-    const hour = nextHour++;
-    const start = `2026-10-05T${String(hour).padStart(2, "0")}:00:00Z`;
-    const end = `2026-10-05T${String(hour + 1).padStart(2, "0")}:00:00Z`;
+    const index = slotIndex++;
+    const day = MONDAYS[Math.floor(index / SLOTS_PER_MONDAY)];
+    if (!day) {
+      throw new Error("Ran out of seeded Monday slots -- add another date to MONDAYS.");
+    }
+    const hour = 9 + (index % SLOTS_PER_MONDAY);
+    const start = `${day}T${String(hour).padStart(2, "0")}:00:00Z`;
+    const end = `${day}T${String(hour + 1).padStart(2, "0")}:00:00Z`;
     const res = await request(app)
       .post("/v1/bookings")
       .set(authHeader(booker))
@@ -238,5 +249,45 @@ describe("payment webhooks (Cashfree)", () => {
     expect(refund.status).toBe("success");
 
     expect(await paymentStatus(paymentId)).toBe("refunded");
+  });
+
+  // Phase 26-H -- exercised here against the REAL adapter, so the amount that
+  // gets compared is the one the real webhook parser actually extracts from a
+  // genuine Cashfree payload shape, not one a fake handed us.
+  it("a correctly-signed webhook claiming a DIFFERENT amount never marks the payment success", async () => {
+    const { id, providerOrderId } = await seedPayment(await createFreshBooking(), 10_000);
+
+    // Correctly signed, genuinely from "Cashfree" -- but for ₹0.01, not ₹100.
+    const res = await postWebhook(paymentSuccessPayload(providerOrderId, "cf_pay_mismatch_1", 0.01));
+
+    expect(res.status).toBe(200); // acknowledged, so Cashfree stops redelivering
+    expect(await paymentStatus(id)).not.toBe("success");
+    expect(await paymentStatus(id)).toBe("failed");
+
+    const { data, error } = await adminClient.from("payments").select("failure_reason").eq("id", id).single();
+    if (error) throw error;
+    expect(data.failure_reason).toContain("mismatch");
+  });
+
+  it("a correctly-signed webhook claiming a DIFFERENT currency never marks the payment success", async () => {
+    const { id, providerOrderId } = await seedPayment(await createFreshBooking(), 10_000);
+    const payload = paymentSuccessPayload(providerOrderId, "cf_pay_mismatch_2", 100);
+    payload.data.payment.payment_currency = "USD"; // right number, wrong money
+
+    const res = await postWebhook(payload);
+    expect(res.status).toBe(200);
+    expect(await paymentStatus(id)).toBe("failed");
+  });
+
+  it("a matching amount and currency still verifies through to success", async () => {
+    const { id, providerOrderId } = await seedPayment(await createFreshBooking(), 10_000);
+    await postWebhook(paymentSuccessPayload(providerOrderId, "cf_pay_match_1", 100));
+    expect(await paymentStatus(id)).toBe("success");
+  });
+
+  it("a mismatch cannot flip an already-successful payment to failed", async () => {
+    const { id, providerOrderId } = await seedPayment(await createFreshBooking(), 10_000, "success");
+    await postWebhook(paymentSuccessPayload(providerOrderId, "cf_pay_match_2", 0.01));
+    expect(await paymentStatus(id)).toBe("success"); // terminal, never walked back
   });
 });
