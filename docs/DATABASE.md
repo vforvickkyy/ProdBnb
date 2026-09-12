@@ -1627,6 +1627,60 @@ was a message-existence oracle for a guessed UUID, and a cursor outside its own 
 wrong state for the "new messages" divider it positions. The subquery runs under the caller's own
 RLS, so it can only ever match a message they are already entitled to read.
 
+### `get_conversations_for_viewer()` (Phase 27-3)
+
+```sql
+public.get_conversations_for_viewer(_cursor_last_message_at timestamptz,
+                                    _cursor_id uuid,
+                                    _limit integer,
+                                    _conversation_id uuid)   -- null = list mode
+```
+
+The Inbox read model, backing both `GET /v1/conversations` and `GET /v1/conversations/:id`.
+`SECURITY DEFINER`, `set search_path = public`, `stable`, granted to `authenticated` and
+`service_role` only — the `PUBLIC` default is explicitly **revoked**, so `anon` cannot call it at
+all (a narrow departure from the other functions here, which leave the default in place; an Inbox
+has no anonymous use case).
+
+**Why `SECURITY DEFINER` is unavoidable.** The Phase 27-3 inspection probed the local stack with
+real participant sessions and found three things that together make an ordinary PostgREST query
+unable to render an Inbox row:
+
+1. **A host can never learn the booker's name.** `profiles` RLS is own-row-or-admin, so a host
+   selecting the booker's profile gets zero rows — and `get_host_public_profile(booker)` returns
+   nothing, because a booker has no published location. There was no existing path at all.
+2. **The booker's view of the host's name is conditional.** `get_host_public_profile()` only
+   answers while that host still has a published listing, so archiving one silently removes the
+   host's name from a thread the booker may still read.
+3. **The listing itself disappears once unpublished.** `locations` SELECT RLS restricts a
+   non-published row to its owner and admins, and `location_media` follows the parent. Verified: a
+   booker in an active conversation about an archived listing still reads the conversation and its
+   messages, but an embedded `locations` resolves to `null` — the row loses its title and thumbnail.
+
+Phase 27-2 deliberately keyed conversation access on **participation, not publication**, so that a
+thread survives its listing being archived. This function is what makes that surviving thread
+renderable. It is the same technique and the same narrow-slice discipline as
+`get_host_public_profile()`.
+
+**It is not an authorization bypass.** It returns exactly the set
+`conversations_select_participant` already permits — `c.booker_id = auth.uid() or l.host_id =
+auth.uid()` — reads `auth.uid()` itself, accepts **no** user id (so it cannot be used to enumerate
+anyone else's Inbox), fails closed when `auth.uid()` is null, and has **no admin branch**. Admin
+access to correspondence remains the separate, audited `admin_message_access` path.
+
+**What it exposes, and nothing more:** conversation `id`, `booking_id`, `last_message_at`,
+`created_at`, `updated_at`, a computed `viewer_role`; listing `id`, `title`, `city`, `status` and
+the primary media **storage key**; counterparty `id`, `first_name`, `last_name`, `avatar_url`.
+Never phone, email, address, profile status, booking detail, message content, or any other
+profile/listing column. Widening it is a security decision, not a convenience one.
+
+Two implementation notes. The media key is returned raw and converted by `publicUrlFor()` in the
+service layer, matching `toPublicMediaItem()` and the search module — SQL never builds URLs. And
+the `limit` clamp is `101`, not `100`: the user-facing maximum of 100 is enforced in
+`messaging.schema.ts`, while the service requests `limit + 1` rows to detect `has_more` without a
+second query, so the SQL ceiling is the defensive backstop for a direct RPC caller rather than the
+product limit.
+
 ### Deliberately absent in V1
 
 No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no

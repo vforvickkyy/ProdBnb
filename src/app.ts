@@ -12,6 +12,7 @@ import { catalogRouter } from "./modules/catalog/catalog.routes";
 import { devicesRouter } from "./modules/devices/device.routes";
 import { locationsRouter } from "./modules/locations/locations.routes";
 import { mediaRouter } from "./modules/media/media.routes";
+import { messagingRouter } from "./modules/messaging/messaging.routes";
 import { notificationsRouter } from "./modules/notifications/notification.routes";
 import { postCashfreeWebhook } from "./modules/payments/payment.controller";
 import { paymentsRouter } from "./modules/payments/payment.routes";
@@ -109,6 +110,7 @@ export function createApp(): Express {
   app.use("/v1", paymentsRouter);
   app.use("/v1", devicesRouter);
   app.use("/v1", notificationsRouter);
+  app.use("/v1", messagingRouter);
   // Mounted at /v1/admin specifically, not /v1 -- adminRouter's blanket
   // requireAuth+requireRole('admin') gate (no path restriction, applied
   // once for the whole router) would otherwise intercept every request for

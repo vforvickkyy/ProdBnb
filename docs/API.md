@@ -55,6 +55,13 @@ Offset-based via query params, demonstrated on `GET /v1/admin/users`:
 `?page=1&pageSize=20` (defaults: `page=1`, `pageSize=20`, max `pageSize=100`) →
 `meta: { page, pageSize, total }` alongside `data`.
 
+> **One documented exception: the messaging module.** `GET /v1/conversations` (Phase 27-3) uses
+> **keyset (cursor) pagination** — `?limit=&cursor=` → `meta: { limit, has_more, next_cursor }`,
+> with no `total`. Unlike every other list here, a conversation list *reorders while you page*: a
+> new message moves a thread to the head, so offset paging would hand a client duplicates and skip
+> rows. See the Messaging section below for the full rationale. Every other endpoint in this
+> document remains offset-paginated.
+
 ## Endpoints
 
 ### `GET /health`
@@ -960,18 +967,138 @@ none of the four dedicated moderation actions produce; the existing `ADMIN_CANCE
 `ADMIN_CREATED_REFUND` actions for the other two) — nothing privileged is reachable through any
 route without leaving a trail.
 
+## Messaging — conversations (Phase 27-3)
+
+Booker ↔ Host conversations. **This phase is conversations only** — there is no endpoint to send
+or read messages yet (Phase 27-4), no read/unread endpoint, and no Realtime. All three routes
+require authentication.
+
+A conversation's identity is `(booker_id, location_id)` — one durable thread per booker per
+listing, enforced by a unique constraint. The host is **derived** from `locations.host_id` and is
+never stored or accepted. No endpoint accepts `booker_id`, `host_id`, a participant list or a
+sender id: the booker is always the authenticated caller. See
+[`docs/DATABASE.md`](DATABASE.md#messaging-data-model-phase-27-1) for the schema and RLS.
+
+**Participants** are exactly the booker and the listing's host. Anyone else — **including an
+admin** — gets an empty list and `404` on detail. There is deliberately no admin branch here;
+admin access to private correspondence is a separate, audited path (`admin_message_access`) in a
+later sub-phase.
+
+### The conversation object
+
+One shape, used identically by both read endpoints:
+
+```json
+{
+  "id": "uuid",
+  "location": {
+    "id": "uuid",
+    "title": "East London Film Studio",
+    "city": "London",
+    "status": "published",
+    "primary_media_url": "https://…/locations/…/original"
+  },
+  "counterparty": { "id": "uuid", "first_name": "Priya", "last_name": "Sharma", "avatar_url": null },
+  "viewer_role": "booker",
+  "booking_id": null,
+  "last_message_at": "2026-09-12T09:14:02Z",
+  "created_at": "2026-09-12T08:00:00Z",
+  "updated_at": "2026-09-12T09:14:02Z"
+}
+```
+
+`viewer_role` (`booker` | `host`) is computed server-side — a client cannot re-derive it, because
+a booker cannot read `locations.host_id` once a listing is unpublished. `counterparty` is the
+listing's host when `viewer_role` is `booker`, and the conversation's booker when it is `host`.
+
+The object deliberately contains **no** messages, message body, unread count or read cursor, and
+**no** `phone`, `email`, `address`, profile `status` or any other profile/listing column. It is
+produced by a narrow `SECURITY DEFINER` function, not by returning database rows —
+see [`docs/DATABASE.md`](DATABASE.md#get_conversations_for_viewer-phase-27-3).
+
+**A conversation stays fully readable after its listing is unpublished**, with its listing and
+counterparty summary intact. Access is keyed on participation, not publication (Phase 27-2), and
+`location.status` reports the listing's real state (`archived`, `suspended`, …) rather than hiding
+it. The deliberate asymmetry: *continuing* an existing conversation always works; *starting* a new
+one requires a `published` listing.
+
+### `GET /v1/conversations`
+
+`?limit=20&cursor=<opaque>` — keyset pagination, ordered `last_message_at DESC, id DESC`.
+
+- `limit`: 1–100, default 20.
+- `cursor`: opaque; encodes the composite `(last_message_at, id)`. The composite is necessary, not
+  decorative — `last_message_at` defaults to `now()`, which is the *transaction* timestamp, so
+  conversations created together share it exactly and a timestamp-only cursor would skip or repeat
+  rows across the tie.
+- A malformed or tampered cursor is `400 VALIDATION_ERROR`, never a 500.
+- There is no `page`, `pageSize`, `booker_id`, `host_id` or `user_id` parameter. Unknown query
+  params are ignored (matching every other list endpoint) — the safety property is that **no
+  parameter exists that could widen the result set**, not that unknown ones are rejected.
+
+```json
+{ "data": [ { "…": "conversation objects" } ],
+  "meta": { "limit": 20, "has_more": true, "next_cursor": "MjAyNi0wOS0xMlQ…" } }
+```
+
+An empty Inbox is `200` with `{"data": [], "meta": {"limit": 20, "has_more": false, "next_cursor": null}}`.
+
+A user who is both a booker and a host sees both sides of their Inbox in one list.
+
+### `GET /v1/conversations/:id`
+
+Returns the same object. **`404 NOT_FOUND` when the conversation does not exist *or* the caller is
+not a participant** — deliberately indistinguishable, so the endpoint is not an id-enumeration
+oracle. An admin who is not a participant gets the same `404`. A malformed UUID is `400`.
+
+### `POST /v1/conversations`
+
+Get-or-create. Requires the `booker` role. **A host cannot initiate a conversation in this phase** —
+the identity is `(booker_id, location_id)` and there is no safe input from which a host could name
+a booker (a host cannot read a booker's profile at all). Host-initiated threads are deferred.
+
+```json
+{ "location_id": "uuid", "booking_id": "uuid | null" }
+```
+
+The body is `.strict()`: any unknown field — `booker_id`, `host_id`, `participants`, `sender_id` — is
+`400 VALIDATION_ERROR`.
+
+Returns **`201`** with the conversation whether it was just created or already existed, matching
+`POST /v1/devices`, this API's existing idempotent-create precedent. N concurrent identical
+requests all succeed and all describe the same conversation — the unique constraint is the
+concurrency authority, and a `23505` is resolved to the existing row rather than surfaced as an
+error.
+
+`booking_id` is optional context, validated against the caller's own bookings. **It is never
+re-pointed**: if the conversation already exists, a different `booking_id` is ignored rather than
+overwriting the context the thread was created with.
+
+| Situation | Result |
+|---|---|
+| Not authenticated | `401 UNAUTHENTICATED` |
+| Caller lacks the `booker` role | `403 FORBIDDEN` |
+| Location missing, draft, archived, suspended, or not visible | `404 NOT_FOUND` — never confirms a private listing exists |
+| Caller is the listing's host (self-conversation) | `400 VALIDATION_ERROR` |
+| `booking_id` is not the caller's, or is for another location | `400 VALIDATION_ERROR` |
+| Unknown body field / malformed UUID | `400 VALIDATION_ERROR` |
+| Conversation already exists, or a concurrent create raced | `201` with the existing conversation |
+
 ## What's intentionally not here yet
 
-Reviews, messaging, favorites, and availability-aware search are later phases — see
-the main project brief. `GET /v1/locations` (search) still does not filter by availability; a
+Reviews, favorites, and availability-aware search are later phases — see
+the main project brief. Messaging is **partially** here: conversations exist (Phase 27-3, above),
+but sending and reading messages, read/unread state, and Realtime delivery do not — those are
+Phase 27-4 onward. `GET /v1/locations` (search) still does not filter by availability; a
 client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
 and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension
 point (`docs/DATABASE.md`) but not implemented — Cashfree funds currently settle into ProdBnb's
 own merchant account, refunds are admin-only, and Razorpay support is a future provider adapter,
 not built this phase. Real APNs push delivery requires Apple Developer configuration this project
 doesn't have yet (`docs/DATABASE.md`'s Phase 8 section) — the notification system is fully built
-and tested against an explicit `disabled` provider in the meantime. Booking reminders, messaging,
-and support notifications are not implemented — no scheduler or messaging/support feature exists
-in this backend yet for them to be a downstream effect of. Android (FCM) and Web Push are future
+and tested against an explicit `disabled` provider in the meantime. Booking reminders, message, and
+support notifications are not implemented — there is no scheduler, no support feature, and no
+message-sending endpoint yet for them to be a downstream effect of (Phase 27-3 added conversations
+only, and creating one produces no notification). Android (FCM) and Web Push are future
 `NotificationProvider` adapters, not built this phase. Video transcoding, image processing, and AI
 analysis remain out of scope for the R2 integration.
