@@ -82,3 +82,38 @@ export const paymentCreationLimiter = rateLimit({
   skip: skipInTest,
   keyGenerator: (req: Request) => req.user?.id ?? ipKeyGenerator(clientIp(req)),
 });
+
+/**
+ * Message sending (Phase 27-4) — the first user-generated-content write in
+ * this API, and the only endpoint where one authenticated caller can create
+ * unbounded rows visible to another user.
+ *
+ * Keyed by the authenticated caller rather than IP, for the same reason as
+ * paymentCreationLimiter: an IP key both under-counts (a corporate or
+ * mobile-carrier NAT shares one limit across many users) and over-counts (one
+ * user cycling IPs evades it) on an authenticated route. requireAuth has
+ * already run, so req.user is set.
+ *
+ * 60 per minute is deliberately generous — comfortably above any human typing
+ * rate, so it never interferes with a real conversation, while still bounding
+ * a scripted flood. This is an anti-abuse floor, not a product quota; it is
+ * not intended to shape normal usage.
+ *
+ * ⚠️ SAME VERCEL CAVEAT AS EVERY LIMITER IN THIS FILE, restated because it is
+ * easy to over-trust a per-user key: the store is in-memory and therefore
+ * PER INSTANCE. Under Fluid compute a warm instance shares state across
+ * concurrent requests, but Vercel spins up additional instances once one is at
+ * capacity — which a burst is exactly the condition to trigger. The effective
+ * limit is therefore (configured limit) x (however many instances are live).
+ * This is a soft baseline, NOT a globally distributed rate limiter. An
+ * authoritative shared count needs an external store (Vercel KV / Upstash
+ * Redis); deliberately not introduced speculatively at pre-launch scale.
+ */
+export const messageSendLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipInTest,
+  keyGenerator: (req: Request) => req.user?.id ?? ipKeyGenerator(clientIp(req)),
+});

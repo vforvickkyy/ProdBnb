@@ -3,6 +3,7 @@ import { NotFoundError, ValidationError } from "../../errors/AppError";
 import { publicUrlFor } from "../../lib/r2";
 import { adminClient } from "../../lib/supabase";
 import { getVisibleLocationOrNull } from "../locations/locations.service";
+import { Cursor, decodeCursor, encodeCursor } from "./cursor";
 import { CreateConversationInput, ListConversationsQuery } from "./messaging.schema";
 
 const UNIQUE_VIOLATION = "23505";
@@ -100,64 +101,6 @@ function toConversation(row: ConversationViewRow): ConversationDetail {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor
-//
-// Opaque base64url of "<last_message_at ISO>|<id>". Opaque because a
-// hand-constructible cursor invites clients to build one, and a cursor is an
-// implementation detail of the ordering, not part of the contract.
-//
-// Carries nothing sensitive: both halves are already present on the row the
-// client just received.
-//
-// Composite because `last_message_at` alone is not unique. `conversations.
-// last_message_at` defaults to now(), which is the TRANSACTION timestamp, so
-// any conversations created in one statement share it exactly — a
-// timestamp-only cursor would then skip or repeat rows across the tie, and an
-// id-only cursor is meaningless against a random v4 uuid.
-// ---------------------------------------------------------------------------
-
-interface Cursor {
-  last_message_at: string;
-  id: string;
-}
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function encodeCursor(row: ConversationDetail): string {
-  return Buffer.from(`${row.last_message_at}|${row.id}`, "utf8").toString("base64url");
-}
-
-/** Any malformed/tampered value is a client error (400), never a 500. */
-function decodeCursor(raw: string): Cursor {
-  const invalid = new ValidationError("Invalid pagination cursor.");
-
-  let decoded: string;
-  try {
-    decoded = Buffer.from(raw, "base64url").toString("utf8");
-  } catch {
-    throw invalid;
-  }
-
-  const separator = decoded.lastIndexOf("|");
-  if (separator === -1) {
-    throw invalid;
-  }
-
-  const last_message_at = decoded.slice(0, separator);
-  const id = decoded.slice(separator + 1);
-
-  if (!UUID_PATTERN.test(id)) {
-    throw invalid;
-  }
-  const timestamp = new Date(last_message_at);
-  if (last_message_at.length === 0 || Number.isNaN(timestamp.getTime())) {
-    throw invalid;
-  }
-
-  return { last_message_at, id };
-}
-
-// ---------------------------------------------------------------------------
 // Reads
 //
 // Both go through get_conversations_for_viewer() on the CALLER'S OWN scoped
@@ -173,7 +116,7 @@ async function fetchConversationView(
   args: { cursor?: Cursor; limit?: number; conversationId?: string }
 ): Promise<ConversationViewRow[]> {
   const { data, error } = await supabase.rpc("get_conversations_for_viewer", {
-    _cursor_last_message_at: args.cursor?.last_message_at ?? null,
+    _cursor_last_message_at: args.cursor?.timestamp ?? null,
     _cursor_id: args.cursor?.id ?? null,
     _limit: args.limit ?? 20,
     _conversation_id: args.conversationId ?? null,
@@ -209,7 +152,7 @@ export async function listConversations(
   return {
     data: page,
     has_more,
-    next_cursor: has_more && last ? encodeCursor(last) : null,
+    next_cursor: has_more && last ? encodeCursor(last.last_message_at, last.id) : null,
   };
 }
 

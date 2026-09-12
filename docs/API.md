@@ -55,12 +55,15 @@ Offset-based via query params, demonstrated on `GET /v1/admin/users`:
 `?page=1&pageSize=20` (defaults: `page=1`, `pageSize=20`, max `pageSize=100`) →
 `meta: { page, pageSize, total }` alongside `data`.
 
-> **One documented exception: the messaging module.** `GET /v1/conversations` (Phase 27-3) uses
-> **keyset (cursor) pagination** — `?limit=&cursor=` → `meta: { limit, has_more, next_cursor }`,
-> with no `total`. Unlike every other list here, a conversation list *reorders while you page*: a
-> new message moves a thread to the head, so offset paging would hand a client duplicates and skip
-> rows. See the Messaging section below for the full rationale. Every other endpoint in this
-> document remains offset-paginated.
+> **One documented exception: the messaging module.** `GET /v1/conversations` (Phase 27-3) and
+> `GET /v1/conversations/:id/messages` (Phase 27-4) use **keyset (cursor) pagination** —
+> `?limit=&cursor=` → `meta: { limit, has_more, next_cursor }`, with no `total`. Both share one
+> opaque `(timestamp, id)` cursor codec (`src/modules/messaging/cursor.ts`), and both order
+> descending with `id` breaking timestamp ties. Unlike every other list here, a conversation list
+> *reorders while you page* — a new message moves a thread to the head — and message history grows
+> at the head, so offset paging would hand a client duplicates and skip rows. See the Messaging
+> sections below for the full rationale. Every other endpoint in this document remains
+> offset-paginated.
 
 ## Endpoints
 
@@ -1084,12 +1087,135 @@ overwriting the context the thread was created with.
 | Unknown body field / malformed UUID | `400 VALIDATION_ERROR` |
 | Conversation already exists, or a concurrent create raced | `201` with the existing conversation |
 
+## Messaging — messages (Phase 27-4)
+
+Sending and reading messages within a conversation. Still **no Realtime, no read/unread state and
+no notifications** — those are Phase 27-6 onward.
+
+Both endpoints require authentication and **neither requires a role**: participation is a
+relationship, not a role, so booker and host both read and send. `requireRole('booker')` applies
+only to conversation *creation*.
+
+Both are participant-gated by `public.is_conversation_participant()` — the same predicate the RLS
+policy uses. A non-participant, a nonexistent conversation, and an **admin who is not a
+participant** all produce the same `404 NOT_FOUND`, so neither endpoint is an id-enumeration
+oracle. There is no admin branch.
+
+### The message object
+
+```json
+{
+  "id": "uuid",
+  "conversation_id": "uuid",
+  "sender_id": "uuid",
+  "body": "Hi Priya, we're looking at 22–24 September…",
+  "client_message_id": "uuid",
+  "created_at": "2026-09-12T09:14:02.481233+00:00"
+}
+```
+
+Exactly six fields — the columns of `public.messages`, nothing computed and nothing hidden.
+
+**There is deliberately no sender profile.** A message's sender is always one of the two
+participants, and the conversation object already carries `counterparty` and `viewer_role`, so a
+client resolves display identity as `sender_id === counterparty.id ? them : me`. This is why the
+phase needs no profile access at all — which matters, because a host structurally cannot read the
+booker's profile (see the Phase 27-3 notes in [`docs/DATABASE.md`](DATABASE.md)).
+
+Also absent: read/unread state (Phase 27-7), booking context, attachments, and any `updated_at` —
+messages are immutable and the table has no such column.
+
+> `created_at` is rendered by Postgres as `…+00:00` with microsecond precision, not JavaScript's
+> `…Z` form. Same instant, different characters — compare instants, not strings.
+
+### `GET /v1/conversations/:id/messages`
+
+`?limit=50&cursor=<opaque>` — keyset pagination, ordered **`created_at DESC, id DESC`** (newest
+first), paging backwards into history. That is how a chat client loads (open on the newest page,
+scroll up for older) and it matches the existing
+`messages_conversation_id_created_at_id_idx` index exactly, so no index was added.
+
+- `limit`: 1–100, **default 50** (the conversation list defaults to 20 — a message page is a
+  screenful of chat, an Inbox page a screenful of threads).
+- `cursor`: opaque; encodes the composite `(created_at, id)`. The composite is required — where
+  two messages share a `created_at`, `id DESC` breaks the tie deterministically; a
+  timestamp-only cursor would skip or repeat rows.
+- A malformed or tampered cursor is `400 VALIDATION_ERROR`, never a 500.
+- A cursor is a *position*, not a capability: it only ever filters within the conversation named
+  in the path.
+- No `page`, `pageSize`, `sender_id` or `user_id` parameter exists. Unknown query params are
+  ignored; the safety property is that none could widen the result set.
+
+```json
+{ "data": [ { "…": "message objects, newest first" } ],
+  "meta": { "limit": 50, "has_more": true, "next_cursor": "MjAyNi0wOS0xMlQ…" } }
+```
+
+An empty conversation is `200` with `{"data": [], "meta": {"limit": 50, "has_more": false, "next_cursor": null}}`.
+
+**Reading messages never marks them read.** No `conversation_reads` row is created or advanced —
+reading and marking-read are separate concepts, and read state is Phase 27-7.
+
+### `POST /v1/conversations/:id/messages`
+
+```json
+{ "body": "text, 1–4000 characters after trimming", "client_message_id": "uuid" }
+```
+
+The body is `.strict()`. Everything that identifies or orders a message is server-derived —
+`sender_id` from the bearer token, `conversation_id` from the path, `id` and `created_at` from the
+database — so supplying `sender_id`, `conversation_id`, `created_at`, `id` or any unknown field is
+`400 VALIDATION_ERROR`, not silently ignored.
+
+`body` is trimmed before validation and storage, so the API's 1–4000 bound is measured on the same
+value as the database's `char_length(btrim(body, …))` CHECK. Interior newlines are preserved
+verbatim. Content is stored literally and never interpreted — the API builds no markup from it.
+
+Returns **`201`** with the message.
+
+**Idempotency.** `client_message_id` is **required** and backed by the database's
+`UNIQUE (conversation_id, sender_id, client_message_id)` — there is no separate idempotency
+system. Generate it once when the user taps Send and reuse it for every retry of that tap.
+
+| Scenario | Result |
+|---|---|
+| Same key, sent twice | `201` with the **same** message — same `id`, same `created_at` |
+| Same key, **different body** | `201` with the **original** message. First write wins; a retry is not an edit |
+| Same key, different conversation | A separate message |
+| Same key, from the other participant | A separate message (`sender_id` is in the key) |
+| N concurrent identical sends | All `201`, all describing the same message; **exactly one row exists** |
+
+A replay never re-stamps `created_at`, so a client cannot bump its own message's position by
+retrying.
+
+| Situation | Result |
+|---|---|
+| Not authenticated | `401 UNAUTHENTICATED` |
+| Not a participant / nonexistent conversation / admin | `404 NOT_FOUND` |
+| Malformed conversation UUID, invalid/missing `client_message_id` | `400 VALIDATION_ERROR` |
+| Empty, whitespace-only, or >4000-character body | `400 VALIDATION_ERROR` |
+| Server-derived or unknown field in the body | `400 VALIDATION_ERROR` |
+| Too many sends in a short window | `429` (see below) |
+
+**Rate limited** per authenticated user — 60 sends per minute, an anti-abuse floor well above any
+human typing rate. ⚠️ The store is in-memory and therefore **per serverless instance**, so under
+scale-out the effective limit is (limit × live instances). It is a soft baseline, not a globally
+distributed limiter.
+
+**Listing publication does not affect messages.** An existing conversation stays fully readable
+*and writable* after its listing is archived or suspended — access is keyed on participation, not
+publication. Only *starting* a new conversation requires a `published` listing.
+
+**Booking state does not affect messages** either. A thread works the same whether its booking is
+pending, confirmed, cancelled, completed or rejected.
+
 ## What's intentionally not here yet
 
 Reviews, favorites, and availability-aware search are later phases — see
-the main project brief. Messaging is **partially** here: conversations exist (Phase 27-3, above),
-but sending and reading messages, read/unread state, and Realtime delivery do not — those are
-Phase 27-4 onward. `GET /v1/locations` (search) still does not filter by availability; a
+the main project brief. Messaging is **partially** here: conversations (Phase 27-3) and message
+sending/reading (Phase 27-4) exist, but read/unread state, Realtime delivery, message
+notifications, attachments, edit/delete and admin messaging access do not — those are Phase 27-6
+onward. `GET /v1/locations` (search) still does not filter by availability; a
 client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
 and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension
 point (`docs/DATABASE.md`) but not implemented — Cashfree funds currently settle into ProdBnb's

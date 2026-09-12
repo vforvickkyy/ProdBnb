@@ -1681,6 +1681,87 @@ the `limit` clamp is `101`, not `100`: the user-facing maximum of 100 is enforce
 second query, so the SQL ceiling is the defensive backstop for a direct RPC caller rather than the
 product limit.
 
+### Message APIs (Phase 27-4)
+
+Migration `20260912220000_phase27_4_messages.sql` adds exactly two objects — one trigger function
+plus its trigger, and one read function. **No table, column, index, policy or grant changes, and
+no new privilege.**
+
+#### `touch_conversation_on_message()` — the last-message cache
+
+An `AFTER INSERT ... FOR EACH ROW` trigger on `messages` that advances
+`conversations.last_message_id` / `last_message_at`.
+
+**Why a trigger.** The invariant is *a message exists ⟺ the conversation's cache reflects it*.
+This backend has no multi-statement transaction facility at all — only `@supabase/supabase-js`,
+where each PostgREST request is one implicit transaction — so the update has to happen inside the
+INSERT's own transaction or not atomically at all. Doing it as a second statement from Express
+would leave a window where a committed message is invisible in the Inbox list. Same technique as
+`enforce_refund_balance_before_insert` (Phase 12).
+
+**Why the `last_message_at <= new.created_at` guard.** Without it the cache can move *backwards*.
+Two messages inserted concurrently into one conversation can commit in either order; if the older
+one commits second, its trigger would overwrite the newer one's cache and the conversation would
+sort to the wrong place in the Inbox. Row-level locking serializes the two UPDATEs, and this
+predicate makes the outcome independent of arrival order — the newest message always wins.
+Verified against a real out-of-order insert and against five concurrent sends.
+
+`<=` rather than `<` so the very first message still lands: a conversation's `last_message_at`
+defaults to `now()` at creation, and a message created in that same transaction would share it.
+
+`updated_at` is deliberately **not** set here — the existing `set_conversations_updated_at` BEFORE
+UPDATE trigger already maintains it for any update to the row, including this one. Verified to
+advance across separate transactions (it appears not to within a single transaction only because
+`now()` is the transaction timestamp).
+
+`SECURITY INVOKER` (the default), matching `set_updated_at()` and `enforce_refund_balance()`.
+Every message insert runs through the backend's service-role client, which holds `UPDATE` on
+`conversations` and bypasses RLS, and `authenticated` has no INSERT grant on `messages` at all, so
+there is no other path in. Non-recursive.
+
+#### `get_conversation_messages()` — message history
+
+```sql
+public.get_conversation_messages(_conversation_id uuid,
+                                 _cursor_created_at timestamptz,
+                                 _cursor_id uuid,
+                                 _limit integer)
+```
+
+**`SECURITY INVOKER`, `STABLE`, `set search_path = public`.** This is the important difference from
+Phase 27-3: `get_conversations_for_viewer()` had to be `SECURITY DEFINER` because ordinary RLS
+structurally could not produce an Inbox row. Message history has no such problem — every field the
+API returns lives on the `messages` row itself, and `messages_select_participant` already grants
+exactly the right rows. **RLS remains the authorization boundary; this function grants nothing and
+has no admin branch.** A non-participant, an admin who is not a participant, and an
+unauthenticated caller all get zero rows from it.
+
+It exists for one reason: to keep the keyset predicate in typed SQL. Expressing
+`created_at < c1 OR (created_at = c1 AND id < c2)` through PostgREST means building an `.or()`
+filter *string* containing an ISO timestamp — whose `:`, `.` and `+` are all PostgREST-reserved
+characters needing careful quoting. Same shape and reasoning as `search_locations()` (Phase 4),
+which is likewise `SECURITY INVOKER` and called via `.rpc()`.
+
+Ordering is `created_at DESC, id DESC` — newest first, an exact match for the **existing**
+`messages_conversation_id_created_at_id_idx (conversation_id, created_at DESC, id DESC)` from
+Phase 27-1. **No index was added**; the query is a pure index range scan on the one already there.
+
+Returns exactly the six columns of `messages`, which is exactly the public DTO. The `limit` clamp
+is `101` for the same reason as `get_conversations_for_viewer()`: the product maximum of 100 lives
+in `messaging.schema.ts`, while the service requests `limit + 1` to detect `has_more` without a
+second query.
+
+`EXECUTE` is revoked from `PUBLIC` and granted only to `authenticated` and `service_role` —
+matching Phase 27-3, though here RLS would filter the rows regardless.
+
+#### Idempotency, unchanged
+
+Message sending relies entirely on the Phase 27-1 constraint
+`UNIQUE (conversation_id, sender_id, client_message_id)`. There is no idempotency table and no
+application-side dedupe: the service inserts, catches `23505`, and returns the row that already
+exists. `sender_id` is in the key deliberately — without it one participant could pick a key
+colliding with the other's and be handed the counterparty's message.
+
 ### Deliberately absent in V1
 
 No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no

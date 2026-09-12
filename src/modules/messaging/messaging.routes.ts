@@ -1,9 +1,22 @@
 import { Router } from "express";
 import { requireAuth } from "../../middleware/auth";
+import { messageSendLimiter } from "../../middleware/rateLimit";
 import { requireRole } from "../../middleware/requireRole";
 import { validate } from "../../middleware/validate";
-import { getConversationDetail, getConversations, postConversation } from "./messaging.controller";
-import { conversationIdParamSchema, createConversationSchema, listConversationsQuerySchema } from "./messaging.schema";
+import {
+  getConversationDetail,
+  getConversations,
+  getMessages,
+  postConversation,
+  postMessage,
+} from "./messaging.controller";
+import {
+  conversationIdParamSchema,
+  createConversationSchema,
+  listConversationsQuerySchema,
+  listMessagesQuerySchema,
+  sendMessageSchema,
+} from "./messaging.schema";
 
 export const messagingRouter = Router();
 
@@ -35,4 +48,27 @@ messagingRouter.get(
   requireAuth,
   validate({ params: conversationIdParamSchema }),
   getConversationDetail
+);
+
+// --- Messages (Phase 27-4) -------------------------------------------------
+// No requireRole on either: both participants read and send, and participation
+// is a relationship rather than a role. `requireRole('booker')` belongs only on
+// conversation CREATION, where a host structurally cannot participate.
+
+messagingRouter.get(
+  "/conversations/:id/messages",
+  requireAuth,
+  validate({ params: conversationIdParamSchema, query: listMessagesQuerySchema }),
+  getMessages
+);
+
+// messageSendLimiter is applied to this route ONLY -- never to the reads. It
+// sits after requireAuth because it keys on req.user.id (see rateLimit.ts),
+// and before validate so a flood is rejected without parsing bodies.
+messagingRouter.post(
+  "/conversations/:id/messages",
+  requireAuth,
+  messageSendLimiter,
+  validate({ params: conversationIdParamSchema, body: sendMessageSchema }),
+  postMessage
 );
