@@ -781,4 +781,134 @@ describe("Phase 27-4: message APIs", () => {
       expect(hostWrite.sender_id).toBe(host.id);
     });
   });
+
+  // ==========================================================================
+  // Phase 27-5: cursor index alignment
+  // ==========================================================================
+
+  describe("deep pagination stays index-aligned (Phase 27-5)", () => {
+    // This is a QUERY-PLAN regression guard, not a functional one -- every
+    // functional property of pagination is already covered above.
+    //
+    // Phase 27-4 shipped the keyset cursor as an OR-chain, which is correct but
+    // which PostgreSQL cannot use as an index range condition under a generic
+    // parameterized plan (the plan PostgREST actually gets). It landed in
+    // `Filter`, so a deep page rescanned and discarded every newer row --
+    // O(offset), the exact thing keyset pagination exists to avoid. Measured
+    // before the fix: 158 buffers at a 4,000-row-deep cursor versus 3 for the
+    // first page. Phase 27-5 replaced it with a single row comparison using
+    // COALESCE sentinels.
+    //
+    // Asserted STRUCTURALLY -- the cursor predicate must appear inside
+    // `Index Cond`, not `Filter` -- rather than against any timing or buffer
+    // count. Two things make that the right call:
+    //   * EXPLAIN of the function CALL only ever shows `Function Scan` (the
+    //     body's LIMIT blocks SQL-function inlining), and that node's buffer
+    //     count folds in first-call planning and catalog reads, so it is not a
+    //     usable measure of page access.
+    //   * Timings and buffer counts drift with the Postgres version, page
+    //     layout and cache state. Whether the predicate is a range condition
+    //     does not.
+    //
+    // So the guard is two-part: the shipped function must still be written with
+    // the row comparison, and that predicate shape must still plan as an index
+    // range condition against the real table and index.
+    //
+    // Needs raw SQL (EXPLAIN is not reachable through PostgREST/supabase-js) and
+    // so shells out to the local stack's container. It skips rather than fails
+    // where that is unavailable, because this asserts a plan property, not
+    // correctness -- every functional guarantee is covered by the tests above.
+    it("the cursor predicate plans as an Index Cond, not a Filter", async () => {
+      const { execFileSync } = await import("child_process");
+
+      let container: string;
+      try {
+        container = execFileSync("docker", ["ps", "--format", "{{.Names}}"], { encoding: "utf8" })
+          .split("\n")
+          .find((n) => n.startsWith("supabase_db_"))!;
+        if (!container) throw new Error("no supabase_db container");
+      } catch {
+        console.warn("[27-5] skipping plan regression: local Supabase container not reachable");
+        return;
+      }
+
+      // Self-contained and rolled back: seeds 5,000 messages, measures the real
+      // function at a 4,000-deep cursor and at the first page, leaves nothing.
+      const sql = `
+begin;
+insert into auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at)
+values ('f1000000-0000-0000-0000-0000000000a1','00000000-0000-0000-0000-000000000000','authenticated','authenticated','p275h@example.com','x',now(),now(),now()),
+       ('f2000000-0000-0000-0000-0000000000a2','00000000-0000-0000-0000-000000000000','authenticated','authenticated','p275b@example.com','x',now(),now(),now());
+insert into public.locations (id, host_id, title, city, country, timezone, status)
+values ('f3000000-0000-0000-0000-0000000000a3','f1000000-0000-0000-0000-0000000000a1','P275','London','UK','UTC','published');
+insert into public.conversations (id, booker_id, location_id, last_message_at)
+values ('f4000000-0000-0000-0000-0000000000a4','f2000000-0000-0000-0000-0000000000a2','f3000000-0000-0000-0000-0000000000a3', now() - interval '2 year');
+insert into public.messages (conversation_id, sender_id, body, client_message_id, created_at)
+select 'f4000000-0000-0000-0000-0000000000a4','f2000000-0000-0000-0000-0000000000a2','m'||g, gen_random_uuid(), now() - (g || ' seconds')::interval
+from generate_series(1,5000) g;
+analyze public.messages;
+select created_at as cts, id as cid from public.messages
+where conversation_id='f4000000-0000-0000-0000-0000000000a4'
+order by created_at desc, id desc offset 4000 limit 1 \\gset
+set plan_cache_mode = force_generic_plan;
+-- The predicate exactly as get_conversation_messages() declares it. Prepared
+-- with real parameters, because the generic plan is the one PostgREST gets and
+-- is the only one in which the OR-chain's failure is visible.
+prepare q (uuid, timestamptz, uuid, int) as
+ select m.id, m.conversation_id, m.sender_id, m.body, m.client_message_id, m.created_at
+ from public.messages m
+ where m.conversation_id = $1
+   and (m.created_at, m.id) < (coalesce($2,'infinity'::timestamptz), coalesce($3,'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+ order by m.created_at desc, m.id desc
+ limit greatest(least(coalesce($4,50),101),1);
+\\echo MARK_DEEP
+explain (analyze, buffers, costs off) execute q('f4000000-0000-0000-0000-0000000000a4', :'cts', :'cid', 51);
+rollback;
+`;
+
+      const out = execFileSync("docker", ["exec", "-i", container, "psql", "-U", "postgres", "-d", "postgres", "-f", "-"], {
+        input: sql,
+        encoding: "utf8",
+        maxBuffer: 10 * 1024 * 1024,
+      });
+
+      const plan = out.slice(out.indexOf("MARK_DEEP"));
+
+      // The cursor boundary must be part of the index range condition, on the
+      // index Phase 27-1 already created.
+      expect(plan).toContain("messages_conversation_id_created_at_id_idx");
+      expect(plan).toMatch(/Index Cond:[\s\S]*ROW\(created_at, id\)/);
+
+      // ...and must NOT have degraded into a post-scan filter, which is exactly
+      // what a revert to the OR-chain -- or to the tempting
+      // `_cursor_created_at is null or (...)` form -- would produce.
+      expect(plan).not.toMatch(/Filter:[\s\S]*created_at/);
+      expect(plan).not.toContain("Rows Removed by Filter");
+
+      // Corroborating guard on the shipped function itself: the predicate must
+      // remain a single row comparison, not an OR-chain.
+      const def = execFileSync(
+        "docker",
+        [
+          "exec",
+          "-i",
+          container,
+          "psql",
+          "-U",
+          "postgres",
+          "-d",
+          "postgres",
+          "-Atc",
+          "select pg_get_functiondef(p.oid) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='get_conversation_messages';",
+        ],
+        { encoding: "utf8" }
+      );
+      // Comments are stripped first: the function body deliberately *describes*
+      // the rejected `_cursor_created_at is null or ...` form, so matching the
+      // raw text would assert on prose rather than on code.
+      const code = def.replace(/--[^\n]*/g, "");
+      expect(code).toContain("coalesce(_cursor_created_at");
+      expect(code).not.toMatch(/_cursor_created_at\s+is\s+null\s+or/i);
+    });
+  });
 });

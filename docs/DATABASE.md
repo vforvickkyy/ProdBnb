@@ -1762,6 +1762,58 @@ application-side dedupe: the service inserts, catches `23505`, and returns the r
 exists. `sender_id` is in the key deliberately — without it one participant could pick a key
 colliding with the other's and be handed the counterparty's message.
 
+### Message cursor index alignment (Phase 27-5)
+
+Migration `20260912230000_phase27_5_message_cursor_index_alignment.sql` — a single
+`create or replace function` on `get_conversation_messages()`. No schema, index, trigger, RLS or
+grant change, and no change to the function's signature, security mode, results or ordering. The
+cursor **wire format is unchanged**, so this is invisible to every client.
+
+Phase 27-4 wrote the keyset predicate in the conventional expanded form —
+`_cursor_created_at is null or created_at < _cursor_created_at or (created_at = _cursor_created_at
+and id < _cursor_id)`. That is logically correct but PostgreSQL cannot turn an OR-chain into an
+index range start condition, so it landed in `Filter`: the scan began at the newest message and
+discarded everything down to the cursor. Measured on a 5,000-message conversation at a
+4,000-row-deep cursor: `Rows Removed by Filter: 4001`, 86 buffers, against 3 for the first page.
+O(offset) — exactly what keyset pagination exists to eliminate.
+
+**The obvious fix does not work**, and this is the part worth remembering. Keeping the null guard
+and swapping only the OR-chain for a row comparison plans perfectly with *literal* values, because
+the planner folds `'…'::timestamptz is null` to false and drops the branch. But PostgREST invokes
+the function with **parameters**, so the generic plan is the one that matters — and there the
+branch cannot be folded. Measured under `plan_cache_mode = force_generic_plan`:
+`Filter: (($2 IS NULL) OR (ROW(created_at, id) < ROW($2, $3)))`, `Rows Removed by Filter: 4001`,
+85 buffers. No better than before.
+
+The fix removes the branch entirely, folding the null case into the comparison with per-type
+maximum sentinels:
+
+```sql
+(m.created_at, m.id) < (
+  coalesce(_cursor_created_at, 'infinity'::timestamptz),
+  coalesce(_cursor_id, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid)
+)
+```
+
+`'infinity'` is greater than every real `timestamptz` and `'ffffffff-…'` is the maximum `uuid`, so
+a null cursor compares as "older than everything" and yields the first page. Under the same
+generic plan the predicate now appears inside `Index Cond` on the **existing** Phase 27-1
+`messages_conversation_id_created_at_id_idx` — 6 buffers at a 4,000-deep cursor, nothing discarded.
+**No new index was required.**
+
+Semantics are identical: row comparison `(a, b) < (c, d)` is defined as `a < c or (a = c and
+b < d)`, which is the predicate it replaces, and both columns are `NOT NULL` so no
+three-valued-logic difference can arise. Verified against the old predicate on a 5,000-message
+fixture across all six boundary cases — first page, mid page, a cursor sitting on a four-way
+timestamp tie, a cursor past the end, an empty conversation, and a cursor from a different
+conversation: **identical row sets in every case**.
+
+`tests/messaging-messages.test.ts` carries the regression guard. It asserts the *structural*
+property — the predicate appears in `Index Cond` and not in `Filter` — rather than any timing or
+buffer count, because `EXPLAIN` of a call to this function only ever shows `Function Scan` (the
+body's `LIMIT` blocks SQL-function inlining) and that node's buffer count folds in first-call
+planning and catalog reads.
+
 ### Deliberately absent in V1
 
 No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no
