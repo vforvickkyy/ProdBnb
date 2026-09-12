@@ -1393,6 +1393,251 @@ two contradictory notifications for the same booking. Verified with a genuine `P
 concurrency test in `tests/hardening.test.ts`, matching the existing shape of the booking-creation
 concurrency tests.
 
+## Messaging data model (Phase 27-1)
+
+Booker ↔ Host conversations. **Phase 27-1 is the schema foundation only** — there is no messaging
+API, no Realtime transport and no notification integration yet; those are later Phase 27
+sub-phases. Purely additive: no existing table, column, policy, grant or trigger changed.
+
+### Conversation identity: `unique (booker_id, location_id)`
+
+One durable thread per **booker + listing**, deliberately not per booking. Three alternatives were
+rejected for concrete reasons:
+
+- **Per booking** would make the app's primary entry point impossible — "Contact Host" from a
+  listing page has no booking by definition, and the pre-booking availability enquiry is the most
+  common first message in the product.
+- **Per (booker, host)** would merge a host's three separate listings into one thread.
+- **Per (booker, location, booking)** fragments: a booker who books the same studio four times
+  ends up with five threads about the same place with the same person, splitting the unread count
+  four ways.
+
+`booking_id` is therefore optional, **mutable context** — which booking the thread is currently
+about, for the conversation header and deep-linking. It is never part of identity and never
+consulted for authorization: a thread stays fully readable *and writable* after its booking is
+rejected, cancelled or completed, which is exactly when the two parties most need to talk.
+
+The **host side is derived**, never stored: the counterparty is `locations.host_id` for
+`conversations.location_id`. A denormalized copy could only ever become a second, weaker source of
+truth, and `locations.host_id` has had no `authenticated` grant since Phase 12, so it cannot drift.
+
+### `public.conversations`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | `gen_random_uuid()` |
+| `booker_id` | `uuid` | `references profiles(id) on delete cascade` |
+| `location_id` | `uuid` | `references locations(id)` — **no cascade**, see below |
+| `booking_id` | `uuid` | nullable, mutable context — `references bookings(id)`, no cascade |
+| `last_message_at` | `timestamptz` | `not null default now()` — what the Inbox sorts by |
+| `last_message_id` | `uuid` | nullable — `references messages(id) on delete set null` |
+| `created_at` / `updated_at` | `timestamptz` | `updated_at` via the shared `set_updated_at()` trigger |
+| | | `unique (booker_id, location_id)` |
+
+`last_message_at`/`last_message_id` are a **denormalized cache** so the Inbox list can sort and
+render a preview without a per-row aggregate over `messages`. `messages` is always the authority;
+neither column is ever read to decide what a conversation contains.
+
+**The circular foreign key.** `conversations.last_message_id → messages.id` and
+`messages.conversation_id → conversations.id` reference each other, so the second table's
+constraint cannot exist before the first table does. The column is declared inline with its
+siblings (keeping one readable definition of the row shape) and only the FK is deferred to an
+`ALTER TABLE ... ADD CONSTRAINT` at the foot of the same migration — which runs in one
+transaction, so there is no window where the column exists unconstrained. `ON DELETE SET NULL`,
+never `CASCADE`: deleting the message a conversation happens to point at must clear the cache, not
+delete the conversation and the rest of its history with it.
+
+### `public.messages`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | `gen_random_uuid()` |
+| `conversation_id` | `uuid` | `references conversations(id) on delete cascade` |
+| `sender_id` | `uuid` | `references profiles(id) on delete cascade` |
+| `body` | `text` | `check (char_length(btrim(body, E' \t\r\n\f\v')) between 1 and 4000)` |
+| `client_message_id` | `uuid` | client-generated idempotency key |
+| `created_at` | `timestamptz` | `not null default now()` — the ordering key, with `id` |
+| | | `unique (conversation_id, sender_id, client_message_id)` |
+
+**Immutable.** No `updated_at`, no `set_updated_at` trigger, and no `INSERT`/`UPDATE`/`DELETE`
+grant to `authenticated` at all — there is no edit, unsend or delete in V1, and a column nothing
+can ever change would misrepresent the model. Ordering is `(created_at, id)`; `created_at` is
+always server-assigned.
+
+> **The trim set is spelled out on purpose.** Single-argument `btrim()` strips **spaces only**, so
+> the obvious `char_length(btrim(body)) >= 1` happily accepts a body consisting entirely of
+> newlines or tabs — precisely the empty message the constraint exists to reject, and which the
+> iOS composer (trimming `.whitespacesAndNewlines`) already treats as empty. This was caught by
+> the Phase 27-1 tests against the first draft of the constraint, not in review; the regression
+> guard for it lives in `tests/messaging-schema.test.ts`.
+
+**Why idempotency is scoped to `(conversation_id, sender_id, client_message_id)`** and not to
+`(conversation_id, client_message_id)`: without `sender_id` in the key, one participant could pick
+a `client_message_id` that collides with the other's, their insert would be rejected as a
+duplicate, and the idempotent re-read would hand them *the other party's message* as if it were
+their own — silently losing what they actually typed. Same role as
+`notifications.source_event_id`, but supplied by the client rather than derived server-side,
+because only the client knows that two requests are the same tap.
+
+### `public.conversation_reads`
+
+One read cursor per `(conversation_id, user_id)` — surrogate `id` PK plus a unique constraint, the
+same "one row per (owner, thing)" shape as `notification_preferences`/`user_roles`. Stores
+`last_read_at` (null = nothing read yet) and `last_read_message_id`
+(`on delete set null`), so a client can draw a "new messages" divider at a precise point rather
+than inferring one from a timestamp.
+
+Deliberately **not** a `messages.is_read` boolean: read state is per-user, so it cannot live on the
+shared message row at all, and a boolean would mean updating N rows per read instead of one.
+
+Deliberately **not** a `conversation_participants` table either. Membership is fully derivable
+(`conversations.booker_id` + `locations.host_id`), so a membership table could only drift out of
+sync with what it mirrors. Holding a row here is **not** what makes someone a participant and its
+absence never denies access — this table is read *state*, nothing more.
+
+### `public.admin_message_access`
+
+ProdBnb messaging is not end-to-end encrypted, and administrators are able to read conversation
+content for legitimate platform purposes (dispute resolution, fraud, abuse investigation, support,
+marketplace integrity, suspected off-platform transactions). That capability is deliberately **not**
+expressed as `participant or has_role(auth.uid(), 'admin')` on the policies below: an admin
+reading someone's private correspondence must be a distinct, recorded act with a stated reason,
+not an invisible widening of an ordinary read.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `admin_user_id` | `uuid` | `references profiles(id)` — **no cascade**, as `admin_audit_log.admin_id` |
+| `conversation_id` | `uuid` | `not null`, **no foreign key** — a bare reference, as `admin_audit_log.target_id` |
+| `action` | `text` | `check (action in ('view_conversation'))` |
+| `reason` | `text` | **`not null`** + `check (char_length(btrim(reason)) > 0)` |
+| `created_at` | `timestamptz` | |
+
+Modelled on `admin_audit_log`: append-only, no `updated_at`, no trigger, no client-writable path —
+so no admin can create, edit or erase an entry, including their own. It holds **no message
+content**. Two deliberate divergences from `admin_audit_log`: `reason` is mandatory *and*
+`CHECK`-constrained non-blank (without the CHECK, `reason: ""` would satisfy `NOT NULL` and defeat
+the whole point), and `action` uses lowercase snake_case like every other enum-shaped column in
+this schema rather than `admin_audit_log.action`'s outlier SCREAMING_SNAKE — this is a separate
+table with its own vocabulary, for a *read* rather than a mutation.
+
+**`conversation_id` carries no foreign key** (corrected in Phase 27-2). 27-1 modelled it as
+`references conversations(id) on delete cascade`, which gave the audit record the wrong lifetime —
+the log of an admin reading someone's private correspondence vanished the moment that
+correspondence was deleted. The cascade was itself avoiding the opposite failure: a *restricting*
+FK would have let a single access record permanently block deletion of the booker's account
+(profile → conversations → blocked), so an admin doing their job could make a user undeletable.
+Dropping the FK resolves both, and matches `admin_audit_log.target_id`, which has referenced
+bookings/locations/users as a bare `uuid not null` since Phase 11 for exactly this reason.
+Consequently this column may point at a conversation that no longer exists — intended behaviour,
+not a dangling reference to repair. `admin_message_access_conversation_id_idx` is retained.
+
+The Admin Messaging authorization/service layer that writes this table, and the admin read path it
+gates, is a **later Phase 27 sub-phase**. Nothing reads or writes it yet.
+
+### Deletion behaviour
+
+Every profile FK above uses `on delete cascade`, this schema's existing convention for the profile
+that *owns* a row (`bookings.booker_id`, `notifications.user_id`, `locations.host_id`,
+`notification_preferences.user_id`). Phase 27-1 followed that convention rather than inventing a
+retention policy, and Phase 27-2 deliberately left it alone. What it actually does was verified
+against the local stack, not inferred:
+
+| Deleting… | Outcome |
+|---|---|
+| a **booker**'s profile | **Succeeds, and takes the whole thread with it** — the conversation, every message in it *including the host's own*, and both read cursors. The host loses their side of the correspondence. |
+| a **host**'s profile | **Fails outright.** `locations.host_id` cascades, so the delete tries to remove their listings, and `conversations.location_id` (`NO ACTION`) blocks it. A host is undeletable as soon as any conversation exists on any of their listings. |
+| any **sender**'s profile | Their messages are removed from threads that otherwise survive, leaving the counterparty holding one side of a dialogue. |
+
+The host case is not new *in kind* — `bookings.location_id` has had the same blocking effect for
+hosts with bookings since Phase 6 — but messaging widens the trigger from "has a booking" to "has
+a booking **or** a conversation".
+
+**None of this is settled.** The approved direction is not to casually destroy the counterparty's
+communication history, and to preserve or anonymise where appropriate — but that is a retention
+and erasure policy with legal weight, interacting with account deletion and data-subject erasure
+requests. `profiles.status` already carries an unused `'deleted'` value a soft-delete design would
+build on. Deliberately deferred: messaging authorization is expressed entirely through RLS
+policies and the participant helper, none of which reference a deletion action, so whatever
+retention model is approved lands as its own later migration without revisiting any of it.
+
+`conversations.location_id` and `conversations.booking_id` deliberately **do not** cascade, exactly
+as `bookings.location_id` and `payments.booking_id` don't: deleting a location or booking that has
+conversation history would silently destroy that history. A location with a conversation therefore
+cannot be deleted (`23503`), the same shape `locations.service.ts` already maps to a clean `409`
+for bookings.
+
+### `is_conversation_participant()`
+
+```sql
+public.is_conversation_participant(_conversation_id uuid) returns boolean
+```
+
+`SECURITY DEFINER`, `set search_path = public`, `stable` — the same technique as
+`public.has_role()` (Phase 1), for the same reason: an ordinary policy cannot join
+`conversations → locations` without dragging both of those tables' own RLS into every row check.
+
+It takes **no user id**, on purpose. `has_role()` takes one and every policy passes `auth.uid()`,
+which is safe there but leaves a function that will answer about anybody — and any function in
+`public` is callable as a PostgREST RPC by anyone holding `EXECUTE`. Reading `auth.uid()`
+internally means there is no caller-supplied identity to trust: the worst an attacker can do by
+calling it directly is learn whether *they* are in a conversation, which they already know. It
+fails closed via an explicit `auth.uid() is not null` guard rather than relying on
+null-comparison semantics.
+
+### RLS
+
+RLS is enabled on all four tables. **No `anon` grant on any of them** — none of this data is ever
+public.
+
+| Table | `authenticated` | Policy |
+|---|---|---|
+| `conversations` | `SELECT` only | participant: `booker_id = auth.uid()` **or** the caller hosts `location_id` (the same shape as `bookings_select_own_or_hosted_or_admin`, minus the admin arm) |
+| `messages` | `SELECT` only | `is_conversation_participant(conversation_id)` |
+| `conversation_reads` | `SELECT`, `INSERT`, `UPDATE` | select-own + write-own, the `notification_preferences` pair. `WITH CHECK` additionally requires participation *and* (Phase 27-2) that `last_read_message_id` belongs to the same conversation |
+| `admin_message_access` | `SELECT` only | `has_role(auth.uid(), 'admin')`, mirroring `admin_audit_log_select_admin_only` — accountability across the whole admin team, not a private per-admin log |
+
+`messages` having **no** `INSERT`/`UPDATE`/`DELETE` grant and no policy for any of them is what
+makes `sender_id` and `created_at` unforgeable rather than merely validated: a client holding a
+real Supabase session cannot fabricate, edit, backdate or delete a message through direct
+PostgREST, only read what it is already entitled to. This is the Phase 12 hardening shape applied
+from the start rather than retrofitted, and it is verified the same way — against real user
+sessions talking to PostgREST, bypassing Express entirely (`tests/messaging-schema.test.ts` and
+`tests/messaging-authorization.test.ts`).
+
+Conversations are likewise `SELECT`-only for `authenticated`: creating or re-pointing one requires
+checks RLS cannot express (the location must be `published`; a supplied `booking_id` must belong to
+the caller *and* to the same location), so it goes through the backend's service-role client.
+
+**Admins get nothing from these policies.** `conversations_select_participant` has no admin arm, so
+an admin who is not a participant sees zero conversations and zero messages through their own
+scoped client — asserted directly, because it is the property most easily broken by a
+well-meaning future edit. Admin access to private correspondence goes through a dedicated Admin
+Messaging service that writes an `admin_message_access` record, never through an invisible
+widening of an ordinary participant read.
+
+**The read cursor is not an authorization mechanism.** Holding a `conversation_reads` row grants
+nothing and its absence denies nothing — participation alone decides access, and a cursor planted
+for a non-participant leaves the conversation and its messages just as invisible. Phase 27-2 added
+one clause to `conversation_reads_write_own`'s `WITH CHECK`: `last_read_message_id` must belong to
+the same conversation as the cursor. Before it, a participant could point their cursor in one
+thread at a message in an unrelated one — verified accepted. Low severity (the FK already required
+the message to exist, and nothing is disclosed by the write), but the success/`23503` distinction
+was a message-existence oracle for a guessed UUID, and a cursor outside its own thread is simply
+wrong state for the "new messages" divider it positions. The subquery runs under the caller's own
+RLS, so it can only ever match a message they are already entitled to read.
+
+### Deliberately absent in V1
+
+No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no
+attachments, no system messages, no support conversations, no group threads, and no Realtime
+configuration (`realtime.messages` policies and the broadcast trigger belong to a later
+sub-phase). There is also no index on `messages.sender_id`, `conversations.booking_id`,
+`conversations.last_message_id` or `conversation_reads.last_read_message_id`: each is a FK whose
+parent-side delete therefore scans, but bookings and messages are never hard-deleted by any code
+path, and profile deletion is a rare administrative operation rather than a request path. Recorded
+as a decision, not an oversight.
+
 ## Granting the admin role
 
 There's no endpoint for this — deliberately. `admin` is powerful enough that granting it should
