@@ -1587,14 +1587,25 @@ null-comparison semantics.
 
 ### RLS
 
-RLS is enabled on all four tables. **No `anon` grant on any of them** — none of this data is ever
-public.
+RLS is enabled on all four tables, and **no messaging migration grants anything to `anon`** — none
+of this data is ever public.
+
+> ⚠️ That is a statement about what these migrations *do*, not about the grants a real database ends
+> up with. Supabase ships `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon,
+> authenticated, service_role`, so a newly created table in `public` arrives with full privileges
+> already granted and a migration's `grant select` is *additive on top of them*. Verified on staging:
+> `conversations`, `messages` and `admin_message_access` all carry `GRANT ALL` to both `anon` and
+> `authenticated`. **RLS is what actually denies those writes** — these tables have no
+> INSERT/UPDATE/DELETE policy, and `anon` matches no policy at all, so such attempts fail as silent
+> zero-row no-ops rather than privilege errors. The grant layer is not carrying its share of the
+> defence in depth. See the Phase 27-8 note below for the full picture; correcting it across the
+> schema is a separate hardening pass in the Phase 12 style.
 
 | Table | `authenticated` | Policy |
 |---|---|---|
 | `conversations` | `SELECT` only | participant: `booker_id = auth.uid()` **or** the caller hosts `location_id` (the same shape as `bookings_select_own_or_hosted_or_admin`, minus the admin arm) |
 | `messages` | `SELECT` only | `is_conversation_participant(conversation_id)` |
-| `conversation_reads` | `SELECT`, `INSERT`, `UPDATE` | select-own + write-own, the `notification_preferences` pair. `WITH CHECK` additionally requires participation *and* (Phase 27-2) that `last_read_message_id` belongs to the same conversation |
+| `conversation_reads` | **`SELECT` only** (since Phase 27-7) | select-own + write-own. 27-1 granted `INSERT`/`UPDATE` here, modelling the table on `notification_preferences`; **Phase 27-7 revoked `INSERT`, `UPDATE` and `DELETE`** after measuring that a client could move its own read cursor *backwards*, and delete the row outright, defeating the monotonicity the cursor exists to provide. The `conversation_reads_write_own` policy is deliberately **kept** as dormant defence in depth — its `WITH CHECK` still requires participation *and* (Phase 27-2) that `last_read_message_id` belongs to the same conversation, so those rules are still standing if a future phase ever re-grants. Writes now go exclusively through `public.mark_conversation_read()` |
 | `admin_message_access` | `SELECT` only | `has_role(auth.uid(), 'admin')`, mirroring `admin_audit_log_select_admin_only` — accountability across the whole admin team, not a private per-admin log |
 
 `messages` having **no** `INSERT`/`UPDATE`/`DELETE` grant and no policy for any of them is what
