@@ -1006,7 +1006,8 @@ One shape, used identically by both read endpoints:
   "booking_id": null,
   "last_message_at": "2026-09-12T09:14:02Z",
   "created_at": "2026-09-12T08:00:00Z",
-  "updated_at": "2026-09-12T09:14:02Z"
+  "updated_at": "2026-09-12T09:14:02Z",
+  "unread_count": 3
 }
 ```
 
@@ -1014,9 +1015,17 @@ One shape, used identically by both read endpoints:
 a booker cannot read `locations.host_id` once a listing is unpublished. `counterparty` is the
 listing's host when `viewer_role` is `booker`, and the conversation's booker when it is `host`.
 
-The object deliberately contains **no** messages, message body, unread count or read cursor, and
-**no** `phone`, `email`, `address`, profile `status` or any other profile/listing column. It is
-produced by a narrow `SECURITY DEFINER` function, not by returning database rows —
+`unread_count` (Phase 27-7) is **this viewer's** count of messages from the counterparty that are
+newer than their read cursor. The viewer's own messages never count — sending is reading — so the
+two participants legitimately see different numbers for the same thread. It is **capped at 100**:
+`100` means "100 or more", which a client may render as "99+". See
+[Read state](#read-state-phase-27-7).
+
+The object deliberately contains **no** messages, message body or read **cursor**, and **no**
+`phone`, `email`, `address`, profile `status` or any other profile/listing column. The cursor
+itself (`last_read_at` / `last_read_message_id`) is returned only by
+`POST /v1/conversations/:id/read`, to the one user it belongs to. The object is produced by a narrow
+`SECURITY DEFINER` function, not by returning database rows —
 see [`docs/DATABASE.md`](DATABASE.md#get_conversations_for_viewer-phase-27-3).
 
 **A conversation stays fully readable after its listing is unpublished**, with its listing and
@@ -1209,6 +1218,85 @@ publication. Only *starting* a new conversation requires a `published` listing.
 **Booking state does not affect messages** either. A thread works the same whether its booking is
 pending, confirmed, cancelled, completed or rejected.
 
+### Read state (Phase 27-7)
+
+Read/unread is a **per-conversation, per-user cursor** — never a per-message flag. One row per
+`(conversation, user)` records the newest message that user has read; unread is everything from the
+counterparty after it. Nothing is stored as a counter, so a count can never drift from the messages
+it describes.
+
+#### `POST /v1/conversations/:id/read`
+
+```json
+{ "last_read_message_id": "uuid" }
+```
+
+Advances the caller's read cursor. Returns **`200`**:
+
+```json
+{
+  "data": {
+    "conversation_id": "uuid",
+    "last_read_at": "2026-09-12T09:14:02Z",
+    "last_read_message_id": "uuid",
+    "unread_count": 0
+  }
+}
+```
+
+**The body takes a message id and nothing else, and it is `.strict()`.** Supplying `last_read_at`,
+a timestamp of any kind, `user_id`, `conversation_id` or any unknown field is `400
+VALIDATION_ERROR` — refused, never ignored.
+
+That is not fussiness about shape. **`last_read_at` is derived server-side from the referenced
+message's own `created_at`, and is never the wall clock.** A message's `created_at` is its
+transaction's start time, so a message whose transaction begins before a mark-read but commits
+after it carries an *earlier* timestamp than the clock did — a wall-clock cursor marks it read
+although the reader could never have seen it, and it is lost from unread permanently. This was
+measured, not theorised. Accepting a client timestamp has the same effect, and additionally lets a
+client send `infinity` and zero its own unread count for good.
+
+**The cursor only ever moves forwards.** Marking an older message read is a `200` no-op that
+returns the cursor which actually stands — not an error, because "read up to at least X" is
+intrinsically idempotent and a client retrying or racing itself has done nothing wrong. Ordering is
+the full `(created_at, id)` tuple, the same total order as message pagination, so two messages
+sharing a `created_at` exactly are still strictly ordered by id.
+
+Monotonicity is enforced **in the database**, not in this API: `authenticated` holds no `INSERT`,
+`UPDATE` or `DELETE` grant on the read-cursor table at all (Phase 27-7), so a client talking to
+PostgREST directly cannot move its cursor backwards, and cannot delete the row to reset it either.
+
+| Situation | Result |
+|---|---|
+| Not authenticated | `401 UNAUTHENTICATED` |
+| Not a participant / nonexistent conversation / **admin who is not a participant** | `404 NOT_FOUND` |
+| Message does not exist | `404 NOT_FOUND` |
+| Message belongs to a **different** conversation | `404 NOT_FOUND` — never confirms another thread's ids |
+| Message **older** than the current cursor | `200`, cursor unchanged |
+| Message already the cursor | `200`, unchanged — idempotent |
+| Newest message | `200`, `unread_count: 0` |
+| N concurrent calls | All `200`; the highest `(created_at, id)` wins |
+| Malformed UUID, missing id, `last_read_at`, or any unknown field | `400 VALIDATION_ERROR` |
+
+Either participant may call it — there is no role requirement, and a host maintains their own
+cursor exactly as a booker does. The two cursors are independent. There is no rate limit: a client
+legitimately marks read on every conversation open, the call creates nothing, and it can only ever
+move the caller's own cursor forwards.
+
+**Reading messages does not mark them read.** `GET /v1/conversations/:id/messages` never touches
+the cursor, and which page a client fetched has no effect on `unread_count`. Marking read is an
+explicit act, because only the client knows what the user actually saw.
+
+**When to call it.** With the id of the newest message you have actually rendered: on opening a
+thread, and again when a new message arrives while it is on screen. Do **not** call it on a
+background refresh or when a push notification arrives — neither means the user read anything.
+
+**No Realtime event is emitted for read state** (see below). Read receipts / "Seen" indicators are
+deliberately not part of V1: one participant's read state stays private to them.
+
+**There is no total-unread endpoint.** A client sums `unread_count` across the conversation list.
+A dedicated aggregate is deferred until the APNs badge in Phase 27-8 needs one.
+
 ### Live delivery over Realtime (Phase 27-6)
 
 Messages are **also** delivered live over Supabase Realtime. **The REST contract above is
@@ -1250,13 +1338,19 @@ archived still delivers live to its participants.
 Typing indicators, presence, read receipts and message notifications are **not** part of this — they
 are later phases.
 
+**Read state is not broadcast** (Phase 27-7, Option A). `message.created` remains the only messaging
+Realtime event. A client updates its own unread badge locally when an event arrives and is corrected
+by the next `GET /v1/conversations`; because unread is *derived* from durable rows rather than
+accumulated from events, a missed, duplicated or out-of-order event cannot corrupt it, and the
+mandatory reconciliation fetch above restores the true count on its own.
+
 ## What's intentionally not here yet
 
 Reviews, favorites, and availability-aware search are later phases — see
 the main project brief. Messaging is **partially** here: conversations (Phase 27-3), message
-sending/reading (Phase 27-4) and live Realtime delivery (Phase 27-6) exist, but read/unread state,
-message notifications, attachments, edit/delete and admin messaging access do not — those are Phase
-27-7 onward. `GET /v1/locations` (search) still does not filter by availability; a
+sending/reading (Phase 27-4), live Realtime delivery (Phase 27-6) and read/unread state
+(Phase 27-7) exist, but message notifications, read receipts, attachments, edit/delete and admin
+messaging access do not — those are Phase 27-8 onward. `GET /v1/locations` (search) still does not filter by availability; a
 client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
 and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension
 point (`docs/DATABASE.md`) but not implemented — Cashfree funds currently settle into ProdBnb's

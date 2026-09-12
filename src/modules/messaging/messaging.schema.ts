@@ -98,3 +98,38 @@ export const sendMessageSchema = z
   })
   .strict();
 export type SendMessageInput = z.infer<typeof sendMessageSchema>;
+
+// ---------------------------------------------------------------------------
+// Read state (Phase 27-7)
+//
+// The path parameter is `conversationIdParamSchema` above, reused as-is:
+// `/v1/conversations/:id/read` names the conversation.
+// ---------------------------------------------------------------------------
+
+/**
+ * `.strict()` is load-bearing, and more so here than anywhere else in this
+ * module.
+ *
+ * The body carries a **message id and nothing else**. Every other field a
+ * client might imagine sending is server-derived: `user_id` from the bearer
+ * token, `conversation_id` from the path, and — critically — `last_read_at`
+ * from the referenced message's own `created_at`.
+ *
+ * That last one is why an extra field must be REFUSED rather than ignored.
+ * The Phase 27-7 inspection measured that a wall-clock or client-supplied read
+ * timestamp silently marks messages read that the reader could never have
+ * seen: a message whose transaction starts before the mark-read but commits
+ * after it carries an earlier `created_at` than the wall clock, so a
+ * timestamp cursor swallows it permanently. A client sending `last_read_at`
+ * must therefore get a 400 rather than have it quietly dropped, which would
+ * leave it believing it had set a cursor position it had not.
+ *
+ * A client could otherwise also send `last_read_at: "infinity"` and zero its
+ * own unread count for good.
+ */
+export const markReadSchema = z
+  .object({
+    last_read_message_id: uuid,
+  })
+  .strict();
+export type MarkReadInput = z.infer<typeof markReadSchema>;

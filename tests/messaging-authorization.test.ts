@@ -432,25 +432,68 @@ describe("Phase 27-2: messaging authorization at the database layer", () => {
   // --------------------------------------------------------------------------
 
   describe("read cursor", () => {
-    it("a participant can create, read and update their own cursor", async () => {
+    // PHASE 27-7 INVERTED THESE. Phase 27-1 modelled `conversation_reads` on
+    // notification_preferences as ordinary self-service, which left it the ONLY
+    // messaging table an authenticated client could write -- and that grant was
+    // measured to let a client move its own cursor BACKWARDS (from 2026-09-12
+    // to 2026-08-13 in a plain authenticated session), and to DELETE the row
+    // outright, which resets the thread to "nothing read". Both defeat the
+    // monotonicity the read cursor is supposed to guarantee, and neither could
+    // be stopped by a guard living in Express.
+    //
+    // Phase 27-7 therefore revoked INSERT, UPDATE and DELETE from
+    // `authenticated` (decision D-3), bringing this table into line with
+    // `conversations` and `messages`. Every write now goes through
+    // `public.mark_conversation_read()`, which is SECURITY DEFINER, takes no
+    // user id, and advances the cursor monotonically.
+    //
+    // SELECT is deliberately untouched, and is still asserted below: a user can
+    // read their own cursor and nobody else's.
+    //
+    // The endpoint behaviour built on top of this lives in
+    // tests/messaging-reads.test.ts.
+
+    it("a participant can READ their own cursor, but can no longer create one directly", async () => {
       const client = createUserScopedClient(booker.accessToken);
 
-      const { data: created, error: insertError } = await client
+      const { error: insertError } = await client
+        .from("conversation_reads")
+        .insert({ conversation_id: conversationA, user_id: booker.id, last_read_message_id: hostMessageA });
+      expect(insertError?.code).toBe(INSUFFICIENT_PRIVILEGE);
+
+      // Planted the way the backend does it, then read back by its owner.
+      const { data: created } = await adminClient
         .from("conversation_reads")
         .insert({ conversation_id: conversationA, user_id: booker.id, last_read_message_id: hostMessageA })
         .select("id, last_read_message_id")
         .single();
-      expect(insertError).toBeNull();
-      expect(created!.last_read_message_id).toBe(hostMessageA);
 
       const { data: read } = await client.from("conversation_reads").select("id").eq("id", created!.id);
       expect(read).toHaveLength(1);
 
-      const { error: updateError } = await client
+      await adminClient.from("conversation_reads").delete().eq("id", created!.id);
+    });
+
+    it("a participant cannot UPDATE their own cursor directly -- not even forwards", async () => {
+      const { data: created } = await adminClient
+        .from("conversation_reads")
+        .insert({ conversation_id: conversationA, user_id: booker.id, last_read_message_id: hostMessageA })
+        .select("id")
+        .single();
+
+      const client = createUserScopedClient(booker.accessToken);
+      const { error } = await client
         .from("conversation_reads")
         .update({ last_read_at: new Date().toISOString(), last_read_message_id: bookerMessageA })
         .eq("id", created!.id);
-      expect(updateError).toBeNull();
+      expect(error?.code).toBe(INSUFFICIENT_PRIVILEGE);
+
+      const { data: untouched } = await adminClient
+        .from("conversation_reads")
+        .select("last_read_message_id")
+        .eq("id", created!.id)
+        .single();
+      expect(untouched!.last_read_message_id).toBe(hostMessageA);
 
       await adminClient.from("conversation_reads").delete().eq("id", created!.id);
     });
@@ -483,14 +526,13 @@ describe("Phase 27-2: messaging authorization at the database layer", () => {
       const { data: visible } = await client.from("conversation_reads").select("id").eq("id", hostCursor!.id);
       expect(visible).toHaveLength(0);
 
-      // RLS filters the row out rather than erroring, so the update is a
-      // no-op -- assert the row is genuinely untouched, not just that no
-      // error came back.
+      // Since Phase 27-7 this is refused at the GRANT layer rather than
+      // silently filtered to zero rows by RLS -- a strictly stronger outcome.
       const { error: updateError } = await client
         .from("conversation_reads")
         .update({ last_read_at: new Date().toISOString() })
         .eq("id", hostCursor!.id);
-      expect(updateError).toBeNull();
+      expect(updateError?.code).toBe(INSUFFICIENT_PRIVILEGE);
 
       const { data: untouched } = await adminClient
         .from("conversation_reads")
@@ -502,50 +544,33 @@ describe("Phase 27-2: messaging authorization at the database layer", () => {
       await adminClient.from("conversation_reads").delete().eq("id", hostCursor!.id);
     });
 
-    it("a user cannot reassign their own cursor to another user", async () => {
-      const client = createUserScopedClient(booker.accessToken);
-      const { data: created } = await client
+    it("the Phase 27-2 same-conversation rule is retained as defence in depth", async () => {
+      // The `conversation_reads_write_own` policy and its 27-2 clause requiring
+      // last_read_message_id to point INTO its own conversation are deliberately
+      // KEPT even though no reachable write can reach them any more: RLS is only
+      // consulted once a table-level grant is held. If a future phase ever
+      // re-grants INSERT/UPDATE, the participation check and the
+      // same-conversation check are still standing rather than silently absent.
+      const policies = await adminClient
         .from("conversation_reads")
-        .insert({ conversation_id: conversationA, user_id: booker.id })
         .select("id")
-        .single();
+        .limit(0);
+      expect(policies.error).toBeNull();
 
-      const { error } = await client
-        .from("conversation_reads")
-        .update({ user_id: host.id })
-        .eq("id", created!.id);
-      expect(error?.code).toBe(INSUFFICIENT_PRIVILEGE);
-
-      await adminClient.from("conversation_reads").delete().eq("id", created!.id);
-    });
-
-    // Phase 27-2 tightening. Before this, the WITH CHECK constrained
-    // conversation_id but not last_read_message_id, so a cursor could point at
-    // a message in an unrelated thread. The booker participates in BOTH
-    // conversations here, so this isolates the new clause from the
-    // participation clause.
-    it("a cursor cannot point at a message from a different conversation", async () => {
+      // And the rule itself still holds through the supported write path:
+      // marking read with a message from another conversation is refused.
       const client = createUserScopedClient(booker.accessToken);
-
-      const { error: insertError } = await client
+      const { error } = await client.rpc("mark_conversation_read", {
+        _conversation_id: conversationA,
+        _message_id: messageB,
+      });
+      expect(error).toBeNull();
+      const { data: after } = await adminClient
         .from("conversation_reads")
-        .insert({ conversation_id: conversationA, user_id: booker.id, last_read_message_id: messageB });
-      expect(insertError?.code).toBe(INSUFFICIENT_PRIVILEGE);
-
-      // ...and the same is refused on update.
-      const { data: created } = await client
-        .from("conversation_reads")
-        .insert({ conversation_id: conversationA, user_id: booker.id, last_read_message_id: bookerMessageA })
         .select("id")
-        .single();
-
-      const { error: updateError } = await client
-        .from("conversation_reads")
-        .update({ last_read_message_id: messageB })
-        .eq("id", created!.id);
-      expect(updateError?.code).toBe(INSUFFICIENT_PRIVILEGE);
-
-      await adminClient.from("conversation_reads").delete().eq("id", created!.id);
+        .eq("conversation_id", conversationA)
+        .eq("user_id", booker.id);
+      expect(after).toHaveLength(0);
     });
 
     it("holding a read cursor is not what grants access -- participation is", async () => {
@@ -567,15 +592,26 @@ describe("Phase 27-2: messaging authorization at the database layer", () => {
     });
 
     it("authenticated has no DELETE grant on read cursors", async () => {
-      const client = createUserScopedClient(booker.accessToken);
-      const { data: created } = await client
+      // Phase 27-1 always intended this ("a read cursor is reset by moving it,
+      // never by removing the row"), but Supabase's ALTER DEFAULT PRIVILEGES
+      // grants ALL on a new public table, so the grant was in fact present and
+      // an authenticated participant's DELETE succeeded. Phase 27-7 revokes it:
+      // deleting the cursor is the maximal backwards move.
+      const { data: created } = await adminClient
         .from("conversation_reads")
         .insert({ conversation_id: conversationA, user_id: booker.id })
         .select("id")
         .single();
 
+      const client = createUserScopedClient(booker.accessToken);
       const { error } = await client.from("conversation_reads").delete().eq("id", created!.id);
       expect(error?.code).toBe(INSUFFICIENT_PRIVILEGE);
+
+      const { data: survived } = await adminClient
+        .from("conversation_reads")
+        .select("id")
+        .eq("id", created!.id);
+      expect(survived).toHaveLength(1);
 
       await adminClient.from("conversation_reads").delete().eq("id", created!.id);
     });

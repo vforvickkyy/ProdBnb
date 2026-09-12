@@ -8,6 +8,7 @@ import {
   getConversations,
   getMessages,
   postConversation,
+  postConversationRead,
   postMessage,
 } from "./messaging.controller";
 import {
@@ -15,6 +16,7 @@ import {
   createConversationSchema,
   listConversationsQuerySchema,
   listMessagesQuerySchema,
+  markReadSchema,
   sendMessageSchema,
 } from "./messaging.schema";
 
@@ -71,4 +73,22 @@ messagingRouter.post(
   messageSendLimiter,
   validate({ params: conversationIdParamSchema, body: sendMessageSchema }),
   postMessage
+);
+
+// --- Read state (Phase 27-7) -----------------------------------------------
+// No requireRole, for the same reason as the message routes: both participants
+// maintain their own read cursor, and participation is a relationship rather
+// than a role. A host reads their Inbox exactly as a booker does.
+//
+// No rate limiter either, deliberately — unlike POST .../messages. A client
+// marks read on every conversation open and again whenever a message arrives
+// while the thread is on screen, so this is legitimately chattier than sending;
+// and it creates nothing, is idempotent, and can only ever move the caller's
+// own cursor forwards. `messageSendLimiter` exists to stop a flood of durable
+// rows from one user, which this endpoint cannot produce.
+messagingRouter.post(
+  "/conversations/:id/read",
+  requireAuth,
+  validate({ params: conversationIdParamSchema, body: markReadSchema }),
+  postConversationRead
 );

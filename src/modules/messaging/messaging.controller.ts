@@ -7,8 +7,10 @@ import {
   CreateConversationInput,
   ListConversationsQuery,
   ListMessagesQuery,
+  MarkReadInput,
   SendMessageInput,
 } from "./messaging.schema";
+import { markConversationRead } from "./reads.service";
 
 /**
  * Keyset-paginated, so `meta` carries `has_more`/`next_cursor` rather than the
@@ -63,4 +65,29 @@ export async function postMessage(req: Request, res: Response): Promise<void> {
   const input = req.valid!.body as SendMessageInput;
   const message = await sendMessage(req.supabase!, req.user!.id, id, input);
   created(res, message);
+}
+
+// ---------------------------------------------------------------------------
+// Read state (Phase 27-7)
+// ---------------------------------------------------------------------------
+
+/**
+ * 200, not 201 and not 204.
+ *
+ * Not 201 because nothing is created from the client's point of view — the
+ * underlying `conversation_reads` row is an implementation detail, and whether
+ * this call inserted one or updated one is not something a client should have
+ * to interpret.
+ *
+ * Not 204 because the response body is the point: the operation is monotonic,
+ * so "mark read up to X" may legitimately leave the cursor somewhere else
+ * entirely (an older X is a no-op). Returning the cursor that actually stands,
+ * plus the unread count that follows from it, is what lets a client reconcile
+ * in one round trip instead of guessing that its request took effect.
+ */
+export async function postConversationRead(req: Request, res: Response): Promise<void> {
+  const { id } = req.valid!.params as ConversationIdParam;
+  const input = req.valid!.body as MarkReadInput;
+  const state = await markConversationRead(req.supabase!, id, input);
+  ok(res, state);
 }

@@ -14,8 +14,13 @@ const UNIQUE_VIOLATION = "23505";
 // One shape for both GET /v1/conversations and GET /v1/conversations/:id, so
 // the list and the detail view cannot drift. Deliberately narrow — see the
 // header of 20260912210000_phase27_3_conversation_views.sql for what is
-// excluded and why. No messages, no unread count, no read cursor (those are
-// later sub-phases), and no phone/email/address/profile-status ever.
+// excluded and why. No messages and no read cursor, and no
+// phone/email/address/profile-status ever.
+//
+// Phase 27-7 added `unread_count` — the one piece of read state an Inbox row
+// needs. The cursor itself (`last_read_at`/`last_read_message_id`) stays out:
+// it is returned only by POST /v1/conversations/:id/read, to the one user it
+// belongs to.
 // ---------------------------------------------------------------------------
 
 export type ViewerRole = "booker" | "host";
@@ -45,6 +50,16 @@ export interface ConversationDetail {
   last_message_at: string;
   created_at: string;
   updated_at: string;
+  /**
+   * Messages from the COUNTERPARTY that are newer than this viewer's read
+   * cursor. The viewer's own messages never count — sending is reading.
+   *
+   * Capped at 100 (Phase 27-7, decision D-1): 100 means "100 or more", which a
+   * client may render as "99+". The cap is what bounds the work, not just the
+   * display — an uncapped count is O(unread) per conversation and one long
+   * unread thread would dominate a whole page.
+   */
+  unread_count: number;
 }
 
 /** Exactly the columns `get_conversations_for_viewer()` returns. */
@@ -64,6 +79,7 @@ interface ConversationViewRow {
   counterparty_first_name: string | null;
   counterparty_last_name: string | null;
   counterparty_avatar_url: string | null;
+  unread_count: number;
 }
 
 function toConversation(row: ConversationViewRow): ConversationDetail {
@@ -97,6 +113,11 @@ function toConversation(row: ConversationViewRow): ConversationDetail {
     last_message_at: row.last_message_at,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    // `count(*)` is bigint, which supabase-js surfaces as a JS number here
+    // (the capped value is 0..100, nowhere near the safe-integer boundary).
+    // Coerced rather than trusted so the DTO is always a number, never a
+    // numeric string.
+    unread_count: Number(row.unread_count),
   };
 }
 

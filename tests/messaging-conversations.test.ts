@@ -238,6 +238,10 @@ describe("Phase 27-3: conversation APIs", () => {
       expect(res.status).toBe(200);
       expect(res.body.data).toEqual([]);
       expect(res.body.meta).toEqual({ limit: 20, has_more: false, next_cursor: null });
+      // Phase 27-7: every list row carries the viewer's own unread count.
+      expect(
+        (res.body.data as { unread_count: unknown }[]).every((c) => typeof c.unread_count === "number")
+      ).toBe(true);
     });
 
     it("an admin who is not a participant sees an empty list -- no admin bypass", async () => {
@@ -424,14 +428,29 @@ describe("Phase 27-3: conversation APIs", () => {
       expect(res.body.error.code).toBe("VALIDATION_ERROR");
     });
 
-    it("exposes only the safe DTO -- no messages, no read state, no private profile fields", async () => {
+    it("exposes only the safe DTO -- no messages, no read CURSOR, no private profile fields", async () => {
       const res = await request(app).get(`/v1/conversations/${conversationA}`).set(authHeader(host));
       const body = res.body.data as Record<string, unknown>;
 
+      // Phase 27-7 added `unread_count` and nothing else. The read CURSOR
+      // itself (last_read_at / last_read_message_id) deliberately stays out:
+      // it is returned only by POST /v1/conversations/:id/read, to the one
+      // user it belongs to.
       expect(Object.keys(body).sort()).toEqual(
-        ["booking_id", "counterparty", "created_at", "id", "last_message_at", "location", "updated_at", "viewer_role"].sort()
+        [
+          "booking_id",
+          "counterparty",
+          "created_at",
+          "id",
+          "last_message_at",
+          "location",
+          "unread_count",
+          "updated_at",
+          "viewer_role",
+        ].sort()
       );
-      for (const forbidden of ["messages", "message", "unread_count", "last_read_at", "last_read_message_id", "last_message_id", "booker_id", "host_id"]) {
+      expect(typeof body.unread_count).toBe("number");
+      for (const forbidden of ["messages", "message", "last_read_at", "last_read_message_id", "last_message_id", "booker_id", "host_id"]) {
         expect(body, forbidden).not.toHaveProperty(forbidden);
       }
 

@@ -1893,12 +1893,155 @@ access to correspondence remains the separate, audited `admin_message_access` pa
 **Not touched:** the `supabase_realtime` publication stays empty (it drives Postgres Changes, which
 this phase does not use), no new index, no new grant on the `realtime` schema.
 
+### Read / unread state (Phase 27-7)
+
+The first consumer of `conversation_reads`, which Phase 27-1 created and nothing had ever written
+to. Three objects: a monotonic write function, `unread_count` on the conversation read model, and a
+grant revocation. No new table, index or trigger, and no Realtime object of any kind.
+
+#### The cursor is `(last_read_at, last_read_message_id)` — one composite value
+
+Both columns are written together and read together. `last_read_at` is the authoritative half;
+`last_read_message_id` is the tiebreaker that makes the cursor a **total order** over the same
+`(created_at, id)` key messages are indexed and paginated by, and the anchor a client draws its
+"new messages" divider at.
+
+**`last_read_at` is the `created_at` of a real message — never `now()`, never client-supplied.**
+This is the phase's central correctness property and it was measured, not assumed. A message's
+`created_at` is its transaction's start time, so a message whose transaction begins before a
+mark-read and commits after it carries an *earlier* timestamp than the wall clock did. A
+`now()` cursor therefore marks it read even though it was uncommitted and invisible when the reader
+marked read, and it is lost from unread permanently. A cursor derived from a message the reader
+could actually see has no such window.
+
+**`last_read_message_id` alone is not sufficient**, which is why both columns exist. It is
+`ON DELETE SET NULL`, so deleting the message it points at — what a sender-profile cascade does —
+leaves `last_read_at` standing with a null id. Resolving a message-id-only cursor would then find
+nothing and flip the whole conversation back to unread. That **half-null** state is legitimate and
+reachable, which is why there is deliberately **no CHECK** tying the two columns together and why
+every comparison coalesces the two halves independently.
+
+#### `mark_conversation_read(_conversation_id, _message_id)`
+
+`SECURITY DEFINER`, `search_path` pinned, returns `SETOF public.conversation_reads`. Takes **no user
+id** — identity is `auth.uid()` read internally — so it cannot move anyone else's cursor, the same
+argument-free shape as `is_conversation_participant()`.
+
+It authorizes **independently of Express**, via `is_conversation_participant()`, and writes nothing
+for a non-participant, a nonexistent conversation, a nonexistent message, or a message belonging to
+another conversation. An admin who is not a participant is refused like any third party; there is no
+admin branch, and an admin can never acquire or advance a participant's cursor.
+
+Monotonicity is a compare-and-swap in the `ON CONFLICT DO UPDATE` guard:
+
+```sql
+where (excluded.last_read_at, excluded.last_read_message_id)
+    > (coalesce(conversation_reads.last_read_at,         '-infinity'::timestamptz),
+       coalesce(conversation_reads.last_read_message_id, '00000000-0000-0000-0000-000000000000'::uuid))
+```
+
+The `COALESCE` sentinels are load-bearing and are the mirror of Phase 27-5's maximum sentinels.
+Without them the comparison against an existing **NULL** cursor evaluates to `NULL` rather than
+`true`, `DO UPDATE … WHERE` skips the row, and the user's *first* mark-read is silently discarded —
+leaving that thread permanently unread. Measured: the naive form returns `INSERT 0 0` with the
+cursor still null.
+
+Under concurrency, `ON CONFLICT DO UPDATE` takes a row lock and re-evaluates its guard against the
+**latest committed** row version rather than the transaction's snapshot, so two racing calls cannot
+interleave into a backwards move. No `SERIALIZABLE`, no advisory lock, no retry loop. Verified with
+real overlapping transactions: the older writer blocked, re-evaluated, and became a no-op.
+
+The function deliberately does **not** `RETURNING` from the upsert. When the guard correctly refuses
+an older cursor the statement affects zero rows, and "you asked to mark an older message read" must
+still answer with the cursor that stands — so it re-selects.
+
+Two functions are `RETURNS SETOF <table>` rather than `RETURNS TABLE (...)` for a concrete reason: a
+`RETURNS TABLE` declares OUT parameters, those become plpgsql variables, and they **shadow** the
+identically-named columns — which makes `on conflict (conversation_id, user_id)` fail outright with
+*"column reference conversation_id is ambiguous"*, since a conflict target cannot be qualified.
+
+#### `unread_count` on `get_conversations_for_viewer()`
+
+A message is unread for user U when it is in the conversation, `sender_id <> U` (your own messages
+are never unread — sending is reading), and its `(created_at, id)` is greater than U's cursor. With
+no cursor row, or a null one, the `-infinity`/minimum-uuid sentinels make everything from the
+counterparty unread.
+
+**Derived, never stored.** A denormalized counter would mean touching a column on the hot
+message-insert path and recomputing on every mark-read — a second source of truth that can drift
+from `messages`, which is the authority. Phase 27-1 rejected a denormalized participant table for
+the same reason.
+
+**Capped at 100** (`limit 101` inside, then `least(…, 100)`): `100` means "100 or more". The cap is
+what bounds the work, not merely the display — an uncapped count is O(unread) per conversation and a
+single long unread thread would dominate an entire Inbox page.
+
+The predicate is a **single unconditional row comparison with `COALESCE` sentinels**, exactly the
+Phase 27-5 shape, so PostgreSQL can use it as an index **range condition** under a generic
+parameterized plan. Measured on a fresh build with 400 conversations / 13,000 messages, under
+`plan_cache_mode = force_generic_plan`:
+
+```
+Index Cond: ((conversation_id = c.id)
+             AND (ROW(created_at, id) > ROW(COALESCE(r.last_read_at, '-infinity'),
+                                            COALESCE(r.last_read_message_id, '0000…'))))
+```
+
+`Index Cond`, not `Filter`, on the existing `messages_conversation_id_created_at_id_idx`. **No index
+was added.** A 20-row page cost 26 buffers / 0.31 ms without the column, 89 / 0.70 ms in the
+steady state, and 547 / 1.19 ms with *everything* unread including a 5,020-message thread — the last
+two differ by far less than the unread volume does, which is the cap doing its job.
+
+#### `conversation_reads` — `authenticated` writes revoked
+
+Phase 27-1 modelled this table on `notification_preferences` as ordinary self-service, which left it
+the **only** messaging table an authenticated client could write. Measured consequences: a client
+moved its own cursor **backwards** through a plain authenticated session, and **deleted** its cursor
+row outright — which resets the thread to "nothing read", the maximal backwards move. A monotonicity
+guarantee living only in Express or only in the function would be bypassed by either.
+
+`INSERT`, `UPDATE` and `DELETE` are therefore revoked from `authenticated`, bringing the table into
+line with `conversations` and `messages`. `SELECT` is untouched — a user still reads their own cursor
+and nobody else's, which is how a client positions its "new messages" divider. `service_role` is
+unaffected.
+
+> ⚠️ **The explicit revokes matter, and `grant select` is not the whole story.** Supabase ships
+> `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES/FUNCTIONS TO anon, authenticated,
+> service_role`, so a newly created object in `public` arrives with full privileges already granted
+> and a migration's `grant select` is *additive on top of them*. Phase 12 knew this and revoked
+> explicitly — `bookings` is `rdDxtm` to this day. The Phase 27-1/27-2 migrations did not, so their
+> "SELECT only" comments describe an intent the grants did not enforce. RLS still denies those
+> writes (the messaging tables have no INSERT/UPDATE/DELETE policies, so they fail as silent
+> zero-row no-ops rather than privilege errors), so data integrity was never at risk — but the
+> grant layer was not carrying its share. `conversation_reads` was the exception where it mattered,
+> because its `FOR ALL` policy *did* permit the DELETE.
+>
+> The same applies to functions: `REVOKE … FROM public` does **not** remove the **direct** `anon`
+> grant that default privileges create. Phase 27-3 and 27-4 revoked only from `PUBLIC`, so `anon`
+> has held EXECUTE on those functions in every freshly built database. Phase 27-7 revokes from both
+> `public` **and** `anon` on the two functions it owns, and a test asserts the resulting ACL —
+> necessary because `DROP FUNCTION` (required to add `unread_count`, since PostgreSQL cannot change
+> a `RETURNS TABLE` return type in place) discards the ACL entirely.
+
+The `conversation_reads_write_own` policy is deliberately **kept** even though no reachable write
+can now reach it: RLS is consulted only once a table-level grant is held, so if a future phase ever
+re-grants `INSERT`/`UPDATE`, the participation check and the Phase 27-2 clause requiring the cursor
+to point *into* its own conversation are still standing rather than silently absent.
+
+#### No Realtime read event
+
+Decision D-6. `message.created` remains the only messaging Realtime event, and
+`conversation_reads` carries no broadcast trigger. Unread is derived from durable rows, so a missed
+or duplicated event cannot corrupt it and no reconciliation protocol of its own is needed.
+Broadcasting read state would only enable read receipts, which changes the privacy model — one
+participant's read state becoming visible to the other — and is a product decision in its own right,
+not something to acquire as a side effect of unread counts.
+
 ### Deliberately absent in V1
 
 No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no
-attachments, no system messages, no support conversations, no group threads, and no Realtime
-configuration (`realtime.messages` policies and the broadcast trigger belong to a later
-sub-phase). There is also no index on `messages.sender_id`, `conversations.booking_id`,
+attachments, no system messages, no support conversations, no group threads, no read receipts, and
+no per-message read flag (read state is a per-user cursor — see Phase 27-7 above). There is also no index on `messages.sender_id`, `conversations.booking_id`,
 `conversations.last_message_id` or `conversation_reads.last_read_message_id`: each is a FK whose
 parent-side delete therefore scans, but bookings and messages are never hard-deleted by any code
 path, and profile deletion is a rare administrative operation rather than a request path. Recorded

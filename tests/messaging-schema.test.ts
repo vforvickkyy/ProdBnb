@@ -694,23 +694,43 @@ describe("Phase 27-1: messaging data model", () => {
       expect(deleteError?.code).toBe(INSUFFICIENT_PRIVILEGE);
     });
 
-    it("a participant may write their OWN read cursor", async () => {
+    it("a participant may READ their own read cursor but no longer write it directly", async () => {
+      // INVERTED BY PHASE 27-7 (decision D-3). Phase 27-1 modelled this table
+      // as ordinary self-service, which made it the only messaging table a
+      // client could write -- and that was measured to let a client move its
+      // own cursor backwards, and to delete the row entirely, both of which
+      // defeat the monotonicity a read cursor exists to provide. Writes now go
+      // exclusively through public.mark_conversation_read().
       const bookerClient = createUserScopedClient(booker.accessToken);
-      const { data, error } = await bookerClient
+
+      const { error: insertError } = await bookerClient
         .from("conversation_reads")
         .insert({ conversation_id: conversationId, user_id: booker.id, last_read_at: new Date().toISOString() })
         .select("id")
         .single();
-      expect(error).toBeNull();
-      expect(data!.id).toBeTruthy();
+      expect(insertError?.code).toBe(INSUFFICIENT_PRIVILEGE);
+
+      const { data: planted } = await adminClient
+        .from("conversation_reads")
+        .insert({ conversation_id: conversationId, user_id: booker.id, last_read_at: new Date().toISOString() })
+        .select("id")
+        .single();
+
+      // SELECT is deliberately untouched -- a client still reads its own cursor.
+      const { data: visible, error: selectError } = await bookerClient
+        .from("conversation_reads")
+        .select("id")
+        .eq("id", planted!.id);
+      expect(selectError).toBeNull();
+      expect(visible).toHaveLength(1);
 
       const { error: updateError } = await bookerClient
         .from("conversation_reads")
         .update({ last_read_at: new Date().toISOString() })
-        .eq("id", data!.id);
-      expect(updateError).toBeNull();
+        .eq("id", planted!.id);
+      expect(updateError?.code).toBe(INSUFFICIENT_PRIVILEGE);
 
-      await adminClient.from("conversation_reads").delete().eq("id", data!.id);
+      await adminClient.from("conversation_reads").delete().eq("id", planted!.id);
     });
 
     it("a user cannot write or read another user's read cursor", async () => {
@@ -734,7 +754,10 @@ describe("Phase 27-1: messaging data model", () => {
         .from("conversation_reads")
         .update({ last_read_at: new Date().toISOString() })
         .eq("id", hostRead!.id);
-      expect(updateError).toBeNull(); // RLS filters the row out; nothing matches
+      // Since Phase 27-7 this is refused at the GRANT layer rather than
+      // silently filtered to zero rows by RLS -- strictly stronger, and the
+      // row is asserted untouched either way.
+      expect(updateError?.code).toBe(INSUFFICIENT_PRIVILEGE);
       const { data: untouched } = await adminClient
         .from("conversation_reads")
         .select("last_read_at")
