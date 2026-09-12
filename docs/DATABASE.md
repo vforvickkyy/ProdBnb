@@ -1814,6 +1814,85 @@ buffer count, because `EXPLAIN` of a call to this function only ever shows `Func
 body's `LIMIT` blocks SQL-function inlining) and that node's buffer count folds in first-call
 planning and catalog reads.
 
+### Realtime message delivery (Phase 27-6)
+
+Migration `20260912235900_phase27_6_realtime_broadcast.sql`. Four objects, and **no change to any
+existing table, column, index, grant, policy or trigger** — and no source-code, API or DTO change.
+
+```
+INSERT into public.messages   (service-role, after API authorization)
+   ├── on_message_created            → touch_conversation_on_message()   last-message cache (27-4/27-5, UNCHANGED)
+   └── on_message_created_broadcast  → broadcast_message_created()       realtime.send() on conversation:<uuid>, private
+```
+
+**Why a separate trigger, not an extension of the existing one.**
+`touch_conversation_on_message()` maintains a *data invariant*; a broadcast is a *delivery side
+effect*. Phase 27-5 showed how subtle that function is (its monotonic guard, its behaviour under
+EvalPlanQual re-checks), so leaving it byte-identical preserves that verification. More concretely:
+the cache update is **conditional** (`last_message_at <= new.created_at`) and legitimately does
+nothing for an out-of-order insert, whereas the broadcast must fire **unconditionally** — two
+functions make that impossible to confuse. PostgreSQL fires `AFTER INSERT` triggers in **name
+order**, so `on_message_created` runs before `on_message_created_broadcast`: cache first, publish
+second.
+
+**Transactional by construction.** `realtime.send()` writes a row into `realtime.messages`, so it
+participates in the message INSERT's own transaction: *a message exists ⟺ its event was published*,
+and **a rolled-back message produces no event** (verified — the broadcast row is visible inside the
+transaction and gone after `rollback`). This is why the publish belongs in a trigger rather than in
+Express: the backend has no multi-statement transaction facility, so an API-side publish could
+commit a message and then fail to announce it, with no way to undo either.
+
+Conversely `realtime.send()` wraps its own body in `EXCEPTION WHEN OTHERS THEN RAISE WARNING`, so a
+Realtime malfunction can never fail a message insert — **and the backend is never told a broadcast
+failed.** Client reconciliation against the history endpoint is therefore mandatory (see
+`docs/API.md`).
+
+**Broadcast is delivery, not storage.** `realtime.messages` is a **daily-partitioned** table that
+Supabase reclaims by dropping partitions. Nothing durable may ever live only there; message content
+is persisted in `public.messages` and read back through `GET /v1/conversations/:id/messages`.
+
+#### Authorization
+
+| Object | Role |
+|---|---|
+| `public.can_access_conversation_topic(_topic text)` | `SECURITY DEFINER`, `STABLE`, `search_path = public`. Parses `conversation:<uuid>` and delegates to `is_conversation_participant()` |
+| `messaging_broadcast_participant_select` on `realtime.messages` | **SELECT only**, `authenticated`, `extension = 'broadcast'` + the helper |
+
+`is_conversation_participant()` is **reused, not re-implemented**, so Realtime authorization and API
+authorization cannot drift — it is the same predicate `messages_select_participant` uses, it reads
+`auth.uid()` internally and accepts no caller-supplied identity.
+
+**Fail-closed topic parsing.** The policy cannot do this inline safely:
+`split_part(realtime.topic(), ':', 2)::uuid` **raises** on a malformed topic, and PostgreSQL does
+not guarantee `AND` short-circuits, so a regex guard in the same expression is not reliably
+protective — and a raise surfaces as a subscribe error rather than a clean deny. The helper is
+`plpgsql` with an explicit exception handler, so "malformed" and "not a participant" are the same
+answer: `false`. Verified for a null, empty, wrongly-prefixed, prefix-only, malformed-UUID and
+injection-shaped topic — all `false`, none raising.
+
+Private channels are **mandatory**: Realtime consults this table's RLS only for channels subscribed
+with `private: true`. A non-private channel bypasses it entirely.
+
+No admin arm — an admin who is not a participant is refused exactly like any third party. Admin
+access to correspondence remains the separate, audited `admin_message_access` path.
+
+> ### ⚠️ NEVER ADD AN INSERT POLICY TO `realtime.messages`
+>
+> `authenticated` already holds table-level **INSERT, SELECT and UPDATE grants** on
+> `realtime.messages` (Supabase ships them) and already holds `EXECUTE` on `realtime.send()` plus
+> `USAGE` on the `realtime` schema. The **only** thing preventing any logged-in user from publishing
+> a forged `message.created` event into someone else's conversation is that this table has no INSERT
+> policy — RLS with zero matching policies denies everything.
+>
+> For the same reason: **never create a `public` wrapper around `realtime.send()`.** Clients cannot
+> reach it today only because PostgREST exposes `public` and `graphql_public`, not `realtime`. A
+> wrapper would hand every authenticated client a publish path.
+>
+> Both invariants are asserted in `tests/messaging-realtime.test.ts`.
+
+**Not touched:** the `supabase_realtime` publication stays empty (it drives Postgres Changes, which
+this phase does not use), no new index, no new grant on the `realtime` schema.
+
 ### Deliberately absent in V1
 
 No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no

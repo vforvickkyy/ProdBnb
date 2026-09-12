@@ -1209,13 +1209,54 @@ publication. Only *starting* a new conversation requires a `published` listing.
 **Booking state does not affect messages** either. A thread works the same whether its booking is
 pending, confirmed, cancelled, completed or rejected.
 
+### Live delivery over Realtime (Phase 27-6)
+
+Messages are **also** delivered live over Supabase Realtime. **The REST contract above is
+unchanged** — Realtime is delivery, PostgreSQL and this API remain the source of truth.
+
+| | |
+|---|---|
+| Channel | `conversation:<conversation_id>` — **must** be subscribed with `private: true` |
+| Event | `message.created` |
+| Payload | **exactly the six-field message object above**, byte-for-byte identical to what `GET`/`POST .../messages` return |
+
+Clients subscribe **directly to Supabase Realtime with their own Supabase session** — the backend is
+not in the delivery path. Only the two conversation participants may subscribe; a third party, and
+an **admin who is not a participant**, are refused by the Realtime service before any payload is
+sent. A non-private channel bypasses authorization entirely and must never be used.
+
+An event is published inside the message's own database transaction, so a message that never
+committed never announces itself. The reverse does **not** hold: a Realtime failure is silent by
+design and cannot fail the write, so a client must be able to reach correct state from this API
+alone.
+
+**Required client contract**
+
+1. **Treat this API as authoritative.** Realtime events are hints that arrive sooner.
+2. **Deduplicate by server `id`** — always, everywhere. This one rule covers the POST-response/event
+   race, reconnect overlap, a retried POST, and the echo of a message sent from another device.
+   `client_message_id` has exactly one job: reconciling your own optimistic bubble. It is useless for
+   deduplicating the counterparty's messages, which carry *their* client id.
+3. **Sort by `(created_at, id)`** after every insert. Realtime delivery order is not guaranteed to
+   match database order — never rely on arrival order.
+4. **Reconcile after subscribing and after every reconnect**: re-fetch
+   `GET /v1/conversations/:id/messages?limit=50` and merge, paging backwards with `cursor` until a
+   page overlaps an `id` you already hold. Doing this immediately *after* subscribing closes the gap
+   between the initial fetch and the subscription.
+
+Listing publication status is irrelevant here too: an existing conversation whose listing is
+archived still delivers live to its participants.
+
+Typing indicators, presence, read receipts and message notifications are **not** part of this — they
+are later phases.
+
 ## What's intentionally not here yet
 
 Reviews, favorites, and availability-aware search are later phases — see
-the main project brief. Messaging is **partially** here: conversations (Phase 27-3) and message
-sending/reading (Phase 27-4) exist, but read/unread state, Realtime delivery, message
-notifications, attachments, edit/delete and admin messaging access do not — those are Phase 27-6
-onward. `GET /v1/locations` (search) still does not filter by availability; a
+the main project brief. Messaging is **partially** here: conversations (Phase 27-3), message
+sending/reading (Phase 27-4) and live Realtime delivery (Phase 27-6) exist, but read/unread state,
+message notifications, attachments, edit/delete and admin messaging access do not — those are Phase
+27-7 onward. `GET /v1/locations` (search) still does not filter by availability; a
 client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
 and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension
 point (`docs/DATABASE.md`) but not implemented — Cashfree funds currently settle into ProdBnb's
