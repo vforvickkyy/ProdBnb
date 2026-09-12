@@ -41,13 +41,18 @@ interface CapturedRequest {
 const mockState = vi.hoisted(() => ({
   nextResponse: { status: 200, apnsId: "apns-id-1" } as MockResponse,
   captured: [] as CapturedRequest[],
+  /** Every host connect() was called with -- Phase 27-8 routes this per device. */
+  connectedHosts: [] as string[],
 }));
 
 vi.mock("http2", () => ({
-  connect: () => ({
+  // The host argument is captured now: before Phase 27-8 it was a single
+  // process-wide value and there was nothing to assert about it.
+  connect: (host: string) => ({
     request: (headers: Record<string, unknown>) => {
       const stream = new EventEmitter() as EventEmitter & { end: (body: string) => void };
       stream.end = (body: string) => {
+        mockState.connectedHosts.push(host);
         mockState.captured.push({ headers, body });
         const response = mockState.nextResponse;
         queueMicrotask(() => {
@@ -93,6 +98,7 @@ describe("DisabledProvider", () => {
 describe("APNsProvider", () => {
   beforeEach(() => {
     mockState.captured = [];
+    mockState.connectedHosts = [];
     mockState.nextResponse = { status: 200, apnsId: "apns-id-1" };
   });
 
@@ -186,5 +192,91 @@ describe("APNsProvider", () => {
     const provider = new APNsProvider();
     const result = await provider.send(baseInput);
     expect(result.status).toBe("failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 27-8
+// ---------------------------------------------------------------------------
+
+describe("APNsProvider: per-device environment routing (Phase 27-8)", () => {
+  beforeEach(() => {
+    mockState.captured = [];
+    mockState.connectedHosts = [];
+    mockState.nextResponse = { status: 200, apnsId: "apns-id-1" };
+  });
+
+  const base = {
+    deviceToken: "device-token-abc",
+    title: "Priya Sharma",
+    body: "Sent you a message.",
+    data: { prodbnb_type: "new_message" },
+  };
+
+  it("sends a sandbox device to the sandbox host", async () => {
+    await new APNsProvider().send({ ...base, environment: "sandbox" });
+    expect(mockState.connectedHosts).toEqual(["https://api.sandbox.push.apple.com"]);
+  });
+
+  it("sends a production device to the production host", async () => {
+    // Code support only -- APNS_ENVIRONMENT remains sandbox-only and no
+    // production credentials exist. This asserts that a device which registered
+    // itself as `production` is routed correctly rather than being sent to the
+    // sandbox host, where Apple answers DeviceTokenNotForTopic and the fan-out
+    // would deactivate a perfectly good device.
+    await new APNsProvider().send({ ...base, environment: "production" });
+    expect(mockState.connectedHosts).toEqual(["https://api.push.apple.com"]);
+  });
+
+  it("falls back to the configured environment when a device recorded none", async () => {
+    await new APNsProvider().send({ ...base, environment: null });
+    expect(mockState.connectedHosts).toEqual(["https://api.sandbox.push.apple.com"]);
+  });
+
+  it("routes each device independently within one fan-out", async () => {
+    const provider = new APNsProvider();
+    await provider.send({ ...base, environment: "sandbox" });
+    await provider.send({ ...base, environment: "production" });
+    expect(mockState.connectedHosts).toEqual([
+      "https://api.sandbox.push.apple.com",
+      "https://api.push.apple.com",
+    ]);
+  });
+});
+
+describe("APNsProvider: thread-id (Phase 27-8)", () => {
+  beforeEach(() => {
+    mockState.captured = [];
+    mockState.connectedHosts = [];
+    mockState.nextResponse = { status: 200, apnsId: "apns-id-1" };
+  });
+
+  const base = {
+    deviceToken: "device-token-abc",
+    environment: "sandbox" as const,
+    title: "Priya Sharma",
+    body: "Sent you a message.",
+    data: { prodbnb_type: "new_message" },
+  };
+
+  it("includes thread-id inside aps when one is supplied", async () => {
+    await new APNsProvider().send({ ...base, threadId: "11111111-1111-1111-1111-111111111111" });
+    const payload = JSON.parse(mockState.captured[0]!.body) as { aps: Record<string, unknown> };
+    expect(payload.aps["thread-id"]).toBe("11111111-1111-1111-1111-111111111111");
+  });
+
+  it("omits thread-id entirely when none is supplied", async () => {
+    // Booking and payment pushes pass no threadId, so their `aps` object must
+    // be byte-identical to what shipped in Phase 8.
+    await new APNsProvider().send(base);
+    const payload = JSON.parse(mockState.captured[0]!.body) as { aps: Record<string, unknown> };
+    expect(payload.aps).not.toHaveProperty("thread-id");
+    expect(payload.aps).toEqual({ alert: { title: base.title, body: base.body }, sound: "default" });
+  });
+
+  it("omits thread-id when it is explicitly null", async () => {
+    await new APNsProvider().send({ ...base, threadId: null });
+    const payload = JSON.parse(mockState.captured[0]!.body) as { aps: Record<string, unknown> };
+    expect(payload.aps).not.toHaveProperty("thread-id");
   });
 });

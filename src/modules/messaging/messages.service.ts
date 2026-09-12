@@ -1,6 +1,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { NotFoundError } from "../../errors/AppError";
 import { adminClient } from "../../lib/supabase";
+import { notifyNewMessage } from "../notifications/notification.service";
 import { decodeCursor, encodeCursor } from "./cursor";
 import { ListMessagesQuery, SendMessageInput } from "./messaging.schema";
 
@@ -144,8 +145,15 @@ export async function listMessages(
  *
  * A successful insert fires `on_message_created`, which advances the
  * conversation's `last_message_id`/`last_message_at` inside this same
- * transaction (Phase 27-4 migration). Message and Inbox ordering therefore
- * commit together or not at all.
+ * transaction (Phase 27-4 migration), and `on_message_created_broadcast`, which
+ * publishes the Realtime `message.created` event (Phase 27-6). Message, Inbox
+ * ordering and live delivery therefore commit together or not at all.
+ *
+ * The APNs notification (Phase 27-8) is deliberately NOT part of that set. It
+ * is an outbound call to a third party, so it happens AFTER the durable write
+ * has committed, in this service layer rather than in a trigger, and
+ * `notifyNewMessage()` can never throw -- a message is durable whether or not
+ * anyone was ever told about it.
  */
 export async function sendMessage(
   supabase: SupabaseClient,
@@ -167,7 +175,13 @@ export async function sendMessage(
     .single();
 
   if (!error && inserted) {
-    return inserted as MessageDetail;
+    const message = inserted as MessageDetail;
+    // AFTER the durable write, never inside it. Awaited rather than
+    // fire-and-forget because a Vercel function may be frozen or torn down the
+    // moment it responds, which would silently drop the push. Guaranteed not to
+    // throw, so this cannot turn a stored message into a failed request.
+    await notifyNewMessage(senderId, conversationId, message.id);
+    return message;
   }
 
   // A retry after a lost response, a double tap, or a concurrent duplicate.
@@ -187,6 +201,11 @@ export async function sendMessage(
       throw lookupError;
     }
     if (existing) {
+      // Deliberately NO notification here. This branch is a replay of a send
+      // that already happened, and the counterparty was already notified for it
+      // -- the `(user_id, source_event_id)` unique constraint would collapse a
+      // second attempt anyway, but not doing the work is clearer than relying
+      // on a collision to undo it.
       return existing as MessageDetail;
     }
     // 23505 with nothing to find means the collision was not the idempotency

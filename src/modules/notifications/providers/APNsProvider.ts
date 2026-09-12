@@ -3,11 +3,20 @@ import * as http2 from "http2";
 import { env } from "../../../config/env";
 import { DeliveryStatus, NotificationProvider, SendPushInput, SendPushResult } from "./NotificationProvider";
 
-// Sandbox only this phase -- env.APNS_ENVIRONMENT's schema (src/config/env.ts)
-// only accepts "sandbox" today. Adding "production" later is a conscious,
-// separate change to both that schema and this map, never a silent flip.
+// Apple's two APNs hosts. Under token (.p8) authentication the SAME credential
+// works against both -- sandbox and production differ only by host, never by
+// key -- so this is a lookup table, not configuration.
+//
+// PHASE 27-8 ADDED THE PRODUCTION ENTRY AS CODE SUPPORT ONLY. Production APNs
+// remains deliberately UNCONFIGURED: env.APNS_ENVIRONMENT's schema
+// (src/config/env.ts) still accepts only "sandbox", there are no production
+// credentials, and nothing selects the production host unless a DEVICE
+// registered itself as `production`. Turning production on is a conscious,
+// separate change to that schema plus real Apple configuration -- never a
+// silent flip.
 const HOSTS: Record<string, string> = {
   sandbox: "https://api.sandbox.push.apple.com",
+  production: "https://api.push.apple.com",
 };
 
 // Reasons Apple documents specifically for a token that will never work
@@ -75,14 +84,15 @@ function mapApnsResponse(status: number, reason: string | undefined): DeliverySt
 export class APNsProvider implements NotificationProvider {
   readonly name = "apns" as const;
 
-  private readonly host: string;
+  /** The process-wide default, used when a device did not record its own environment. */
+  private readonly defaultHost: string;
 
   constructor() {
     const host = HOSTS[env.APNS_ENVIRONMENT];
     if (!host) {
       throw new Error(`No APNs host configured for APNS_ENVIRONMENT='${env.APNS_ENVIRONMENT}'.`);
     }
-    this.host = host;
+    this.defaultHost = host;
     // Fail fast at construction time, not on the first send.
     requireConfig("APNS_TEAM_ID");
     requireConfig("APNS_KEY_ID");
@@ -90,13 +100,43 @@ export class APNsProvider implements NotificationProvider {
     requireConfig("APNS_PRIVATE_KEY");
   }
 
+  /**
+   * Chooses the APNs host PER DEVICE (Phase 27-8), not once per process.
+   *
+   * An APNs device token belongs to exactly one environment -- decided by the
+   * `aps-environment` entitlement in the build that produced it -- and iOS
+   * records which one in `user_devices.environment`. Before this phase that
+   * value was passed to send() and IGNORED: every push went to whatever
+   * env.APNS_ENVIRONMENT said.
+   *
+   * That is harmless while only sandbox exists, and becomes a real bug the
+   * moment production tokens appear. One user can legitimately hold a
+   * TestFlight (sandbox) token and an App Store (production) token at the same
+   * time, and a single fan-out must reach both. Sending a token to the wrong
+   * host returns `DeviceTokenNotForTopic`, which mapApnsResponse() classifies
+   * as `invalid_token` -- so the old behaviour would have DEACTIVATED a
+   * perfectly good device rather than delivering to it.
+   *
+   * A null/unknown environment falls back to the configured default, so every
+   * device registered before this phase behaves exactly as it did.
+   */
+  private hostFor(environment: SendPushInput["environment"]): string {
+    return (environment && HOSTS[environment]) || this.defaultHost;
+  }
+
   async send(input: SendPushInput): Promise<SendPushResult> {
     const payload = JSON.stringify({
-      aps: { alert: { title: input.title, body: input.body }, sound: "default" },
+      aps: {
+        alert: { title: input.title, body: input.body },
+        sound: "default",
+        // Only emitted when the caller supplied one, so a booking or payment
+        // push carries a byte-identical `aps` object to before Phase 27-8.
+        ...(input.threadId ? { "thread-id": input.threadId } : {}),
+      },
       ...input.data,
     });
 
-    const session = http2.connect(this.host);
+    const session = http2.connect(this.hostFor(input.environment));
     try {
       const result = await new Promise<SendPushResult>((resolve, reject) => {
         const stream = session.request({

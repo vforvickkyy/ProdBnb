@@ -22,6 +22,19 @@ export interface SendPushInput {
   body: string;
   /** Flattened string map -- becomes the top-level custom userInfo keys (e.g. prodbnb_type). */
   data: Record<string, string>;
+  /**
+   * Groups related notifications into one thread in the OS notification centre
+   * -- the conversation id, for messaging (Phase 27-8). Without it, thirty
+   * messages in one thread are thirty separate banners.
+   *
+   * Declared HERE rather than read out of `data.prodbnb_conversation_id` inside
+   * the APNs adapter, so the concept stays provider-agnostic: this maps to
+   * APNs `aps.thread-id` and to FCM's notification tag, and a provider that has
+   * no such concept simply ignores it. Optional, so every existing caller --
+   * every booking and payment notification -- is unchanged and emits no
+   * grouping key at all.
+   */
+  threadId?: string | null;
 }
 
 export interface SendPushResult {

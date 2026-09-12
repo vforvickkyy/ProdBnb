@@ -900,18 +900,67 @@ Response (`200`): `{ "data": { "marked_read": 3 } }`
 
 ### `GET /v1/notification-preferences`
 
-Requires authentication. Always returns both categories, defaulting any missing row to `true`:
+Requires authentication. Always returns every category, defaulting any missing row to `true`:
 
 ```json
-{ "data": { "booking": true, "payment": true } }
+{ "data": { "booking": true, "payment": true, "message": true } }
 ```
 
 ### `PATCH /v1/notification-preferences`
 
-Requires authentication. Request: `{ "booking": true, "payment": false }` (either field optional,
-at least one required). **Disabling a category only suppresses push delivery for it — the in-app
-notification list is never affected**, per `docs/DATABASE.md`'s explanation of why critical
-transactional notifications can't accidentally disappear.
+Requires authentication. Request: `{ "booking": true, "payment": false, "message": true }` (every
+field optional, at least one required). **Disabling a category only suppresses push delivery for it
+— the in-app notification list is never affected**, per `docs/DATABASE.md`'s explanation of why
+critical transactional notifications can't accidentally disappear.
+
+`message` (Phase 27-8) gates message push. Because a missing row means enabled, adding the category
+needed no backfill and every existing user is opted in.
+
+### Message notifications (Phase 27-8)
+
+Sending a message notifies **the other participant** — the host when the booker sends, the booker
+when the host sends. A sender is never notified of their own message: the recipient is *computed* as
+the participant who is not the sender, not filtered afterwards.
+
+The notification is created **after** the message row has committed, and it can never fail the send.
+`POST /v1/conversations/:id/messages` returns `201` with the message whether the push succeeded,
+failed, or was skipped because no provider is configured — the durable message is authoritative and
+is always readable from `GET /v1/conversations/:id/messages`.
+
+**The push never contains message content.** The title is the sender's name and the body is a fixed
+string:
+
+```json
+{
+  "aps": {
+    "alert": { "title": "Priya Sharma", "body": "Sent you a message." },
+    "sound": "default",
+    "thread-id": "<conversation_id>"
+  },
+  "prodbnb_type":            "new_message",
+  "prodbnb_entity_type":     "conversation",
+  "prodbnb_entity_id":       "<conversation_id>",
+  "prodbnb_conversation_id": "<conversation_id>",
+  "prodbnb_message_id":      "<message_id>"
+}
+```
+
+This is deliberate. A push is rendered on a locked screen and mirrored to paired devices, and
+ProdBnb messages carry rates, addresses, schedules and client names — so the same generic-copy rule
+Phase 8 applied to bookings and payments applies here. The client opens the thread and reads the
+real message from this API. When a sender has no name recorded, the title falls back to
+`"New message"`.
+
+`thread-id` groups a conversation into one entry in the notification centre rather than one banner
+per message. There is **one push per message** — no coalescing in V1.
+
+**A push is always attempted; the client decides whether to show it.** The server has no way to know
+whether the app is open or which screen is visible, so it cannot suppress on that basis. iOS already
+hides the banner when the user is looking at that conversation. Read state (Phase 27-7) does **not**
+suppress pushes — a push describes a message that is by definition newer than the recipient's
+cursor.
+
+**No badge count** is sent in V1, and there is still no total-unread endpoint.
 
 ## Admin (Phase 11)
 
@@ -1348,18 +1397,18 @@ mandatory reconciliation fetch above restores the true count on its own.
 
 Reviews, favorites, and availability-aware search are later phases — see
 the main project brief. Messaging is **partially** here: conversations (Phase 27-3), message
-sending/reading (Phase 27-4), live Realtime delivery (Phase 27-6) and read/unread state
-(Phase 27-7) exist, but message notifications, read receipts, attachments, edit/delete and admin
-messaging access do not — those are Phase 27-8 onward. `GET /v1/locations` (search) still does not filter by availability; a
+sending/reading (Phase 27-4), live Realtime delivery (Phase 27-6), read/unread state
+(Phase 27-7) and message push notifications (Phase 27-8) exist, but read receipts, attachments,
+edit/delete, badge counts and admin messaging access do not. `GET /v1/locations` (search) still does not filter by availability; a
 client checks a candidate location's availability separately via `GET /v1/locations/:id/availability`
 and books via `POST /v1/bookings`. Host payouts / commission splitting are a documented extension
 point (`docs/DATABASE.md`) but not implemented — Cashfree funds currently settle into ProdBnb's
 own merchant account, refunds are admin-only, and Razorpay support is a future provider adapter,
 not built this phase. Real APNs push delivery requires Apple Developer configuration this project
 doesn't have yet (`docs/DATABASE.md`'s Phase 8 section) — the notification system is fully built
-and tested against an explicit `disabled` provider in the meantime. Booking reminders, message, and
-support notifications are not implemented — there is no scheduler, no support feature, and no
-message-sending endpoint yet for them to be a downstream effect of (Phase 27-3 added conversations
-only, and creating one produces no notification). Android (FCM) and Web Push are future
+and tested against an explicit `disabled` provider in the meantime. Message notifications ship in Phase 27-8. Booking reminders and
+support notifications are not implemented — there is no scheduler and no support feature for them to
+be a downstream effect of. Creating a conversation still produces no notification; sending a message
+does. Android (FCM) and Web Push are future
 `NotificationProvider` adapters, not built this phase. Video transcoding, image processing, and AI
 analysis remain out of scope for the R2 integration.

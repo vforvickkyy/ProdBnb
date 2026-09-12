@@ -306,16 +306,16 @@ describe("notifications", () => {
     it("defaults to enabled for a fresh user with no preference rows", async () => {
       const res = await request(app).get("/v1/notification-preferences").set(authHeader(otherBooker));
       expect(res.status).toBe(200);
-      expect(res.body.data).toEqual({ booking: true, payment: true });
+      expect(res.body.data).toEqual({ booking: true, payment: true, message: true });
     });
 
     it("updates and persists a preference", async () => {
       const patch = await request(app).patch("/v1/notification-preferences").set(authHeader(otherBooker)).send({ payment: false });
       expect(patch.status).toBe(200);
-      expect(patch.body.data).toEqual({ booking: true, payment: false });
+      expect(patch.body.data).toEqual({ booking: true, payment: false, message: true });
 
       const get = await request(app).get("/v1/notification-preferences").set(authHeader(otherBooker));
-      expect(get.body.data).toEqual({ booking: true, payment: false });
+      expect(get.body.data).toEqual({ booking: true, payment: false, message: true });
     });
 
     it("a disabled category suppresses push delivery but NEVER the in-app notification itself", async () => {

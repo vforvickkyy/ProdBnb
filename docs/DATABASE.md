@@ -2037,6 +2037,100 @@ Broadcasting read state would only enable read receipts, which changes the priva
 participant's read state becoming visible to the other — and is a product decision in its own right,
 not something to acquire as a side effect of unread counts.
 
+### Message notifications (Phase 27-8)
+
+Messaging reuses the Phase 8 notification system wholesale — the provider, `user_devices`, the
+preference gate, `notification_delivery_attempts`, and the iOS token lifecycle from Phase 26-K all
+already existed. **The only schema change is three widened CHECK constraints**, which is what the
+27-8 inspection found actually blocked a message notification (proven by attempting the inserts,
+not by reading the DDL):
+
+| Constraint | Before | After |
+|---|---|---|
+| `notifications_type_check` | 7 booking/payment types | `+ new_message` |
+| `notifications_entity_type_check` | `in ('booking')` | `in ('booking','conversation')` |
+| `notification_preferences_category_check` | `in ('booking','payment')` | `+ message` |
+
+Each is purely widening, so no existing row can be invalidated and no backfill is needed. Because a
+missing preference row means **enabled**, adding the `message` category opted every existing user in
+without touching a single row.
+
+No new table, index, trigger, policy or grant. No foreign key from `notifications.entity_id` to
+`conversations.id` — it has always been a bare uuid (it points at bookings with no FK either), and
+adding one would let a deleted conversation either block the delete or erase the notification
+history describing it, the same conclusion Phase 27-2 reached for `admin_message_access`.
+
+#### Where the notification happens, and why not in a trigger
+
+```
+POST /v1/conversations/:id/messages
+  └─ INSERT messages                          ← DURABLE, authoritative
+       ├─ on_message_created            → last-message cache        (27-4)
+       └─ on_message_created_broadcast  → Realtime message.created  (27-6)
+  └─ notifyNewMessage()                       ← AFTER commit, in the service layer
+```
+
+The two triggers are inside the insert's transaction because both maintain state that must commit
+with the message. **The push deliberately is not.** It is an outbound call to Apple: it cannot join
+a Postgres transaction, a slow or failed response must never hold or roll back a stored message, and
+a trigger cannot make an HTTPS request at all without new infrastructure. It is also **awaited**
+rather than fire-and-forget, because a serverless function may be frozen the moment it responds.
+
+`notifyNewMessage()` routes through `safeNotify()` like every other notification helper, so the
+invariant is unconditional: **a message is durable whether or not anyone was ever told about it.**
+A lost push is recoverable because the client reconciles against the history endpoint anyway (the
+Phase 27-6 contract).
+
+#### Recipient and idempotency
+
+The recipient is *computed* as the participant who is not the sender — the host when the booker
+sends, the booker when the host sends — so a sender cannot be notified of their own message by any
+code path. `conversations` does not store the host; it is derived through `locations.host_id`, which
+has had no `authenticated` grant since Phase 12, so resolution goes through the service-role client.
+That is necessary rather than convenient: a host frequently cannot read a booker's profile at all
+(Phase 27-3).
+
+`source_event_id` is `message:<message_id>:new_message` — keyed on the **message**, not the
+conversation. The documented convention is `<trigger>:<trigger id>:<type>`, and the trigger is the
+message; `notifyPaymentSuccess` has always keyed on `payment:<payment_id>:…` while its entity is the
+booking. Keying on the conversation instead would collapse an entire thread into **one notification,
+forever** — under `UNIQUE (user_id, source_event_id)` the second message would be a silent no-op.
+This composes with Phase 27-4's send idempotency: a retried `POST` returns the same message id, so
+it yields the same key.
+
+#### Privacy
+
+The push carries the sender's **name** and a fixed body. It never carries message text — the notify
+function receives a message *id*, not the body, so a leak is prevented by the signature rather than
+by remembering. A push is rendered on a locked screen and mirrored to paired devices, and ProdBnb
+messages carry rates, addresses, schedules and client names. This is the same deliberately generic
+copy Phase 8 chose for bookings and payments.
+
+#### Per-device APNs environment (Phase 27-8)
+
+An APNs token belongs to exactly one environment, decided by the `aps-environment` entitlement in
+the build that produced it, and iOS records which in `user_devices.environment`. Before this phase
+that value was passed to the provider and **ignored** — every push went to whatever
+`APNS_ENVIRONMENT` said. Harmless while only sandbox exists; a real bug the moment production tokens
+appear, because one user can hold a TestFlight (sandbox) and an App Store (production) token
+simultaneously and a single fan-out must reach both. Sending a token to the wrong host returns
+`DeviceTokenNotForTopic`, which the provider classifies as `invalid_token` — so the old behaviour
+would have **deactivated a perfectly good device**.
+
+The host is now chosen per send, falling back to the configured default when a device recorded no
+environment, so every pre-existing device behaves exactly as before. **Production remains
+unconfigured**: `APNS_ENVIRONMENT` still accepts only `sandbox` and no production credentials exist.
+Only the host constant was added.
+
+#### Delivery failures are isolated per device
+
+The fan-out loop body was previously unguarded, so a failed `notification_delivery_attempts` INSERT
+threw, unwound to `safeNotify()`, and every device **later in the list** silently received nothing —
+nothing user-visible broke, which is what made it hard to notice. Each iteration is now wrapped:
+logging is best-effort, deactivation is best-effort, and one device's bookkeeping failure can no
+longer suppress another device's push. Messaging is what makes multi-device fan-out routine rather
+than rare.
+
 ### Deliberately absent in V1
 
 No conversation status/state machine, no message `kind`/`type` column, no `messages.updated_at`, no
