@@ -90,6 +90,13 @@ Requires authentication. Returns the caller's profile and the marketplace roles 
       "first_name": "Alex",
       "last_name": "Producer",
       "avatar_url": null,
+      "phone": "+91 98765 43210",
+      "address_line1": "12 Hill Road",
+      "address_line2": null,
+      "address_city": "Mumbai",
+      "address_region": "Maharashtra",
+      "address_country": "India",
+      "address_postal_code": "400050",
       "status": "active",
       "created_at": "2026-09-01T12:00:00Z",
       "updated_at": "2026-09-01T12:00:00Z"
@@ -101,15 +108,41 @@ Requires authentication. Returns the caller's profile and the marketplace roles 
 
 ### `PATCH /v1/me`
 
-Requires authentication. Updates the caller's own profile. Only `first_name`, `last_name`, and
-`avatar_url` are accepted — any other field (including `status`) is rejected as a validation
-error, and the database's own column grants would refuse it even if it weren't. At least one
-field is required.
+Requires authentication. Updates the caller's own profile. Accepted fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `first_name` | string, 1–100 | |
+| `last_name` | string, 1–100 | |
+| `avatar_url` | URL or `null` | |
+| `phone` | string, 5–32, or `null` | Phase 26-MB |
+| `address_line1` | string, 1–200, or `null` | Phase 26-MB |
+| `address_line2` | string, 1–200, or `null` | Phase 26-MB |
+| `address_city` | string, 1–120, or `null` | Phase 26-MB |
+| `address_region` | string, 1–120, or `null` | Phase 26-MB |
+| `address_country` | string, 1–120, or `null` | Phase 26-MB |
+| `address_postal_code` | string, 1–20, or `null` | Phase 26-MB |
+
+Any other field (including `status` and `email`) is rejected as a validation error, and the
+database's own column grants would refuse it even if it weren't. At least one field is required.
+
+**Partial by design.** Omit a field to leave it alone; send an explicit `null` to clear it. An
+empty string is a validation error rather than a silent clear, so an accidentally-blank form field
+can't erase stored data.
+
+**Phone validation is deliberately international.** It accepts digits plus the punctuation people
+actually type (`+ ( ) - . ` and spaces), requires at least five digits, and permits `+` only at the
+start. It is stored exactly as entered apart from trimming — no E.164 normalisation, so a user
+reads back what they typed. This is intentionally *not* the `/^\d{10}$/` rule in
+`payment.schema.ts`, which is Cashfree's India-only requirement for an order payload.
+
+`phone` is the profile's own field and is **not** synchronised with `auth.users.phone`, which is
+only populated by the phone-OTP sign-in flow and so is absent for email, Apple and Google users.
 
 Request:
 
 ```json
-{ "first_name": "Alex", "last_name": "Producer" }
+{ "first_name": "Alex", "last_name": "Producer", "phone": "+91 98765 43210" }
 ```
 
 Response: `{ "data": { "profile": { "...": "updated profile" } } }`

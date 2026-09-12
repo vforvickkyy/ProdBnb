@@ -2,7 +2,12 @@ import { SupabaseClient } from "@supabase/supabase-js";
 import { NotFoundError } from "../../errors/AppError";
 import { UpdateProfileInput } from "./users.schema";
 
-export interface ProfileRow {
+/**
+ * The profile fields that existed before Phase 26-MB, and the only ones the
+ * admin listing selects. Split out so `AdminProfileRow` cannot claim the
+ * contact fields it deliberately does not fetch (see `ADMIN_PROFILE_COLUMNS`).
+ */
+interface ProfileBaseRow {
   id: string;
   first_name: string | null;
   last_name: string | null;
@@ -12,10 +17,45 @@ export interface ProfileRow {
   updated_at: string;
 }
 
-const PROFILE_COLUMNS = "id, first_name, last_name, avatar_url, status, created_at, updated_at";
-const ADMIN_PROFILE_COLUMNS = `${PROFILE_COLUMNS}, user_roles ( role )`;
+/**
+ * What `GET /v1/me` returns: the base profile plus the user's own contact
+ * details (Phase 26-MB). All nullable — a profile that predates the migration,
+ * or a user who simply never supplied them, reads back `null`.
+ *
+ * `email` is deliberately absent, as it always has been: it lives in
+ * `auth.users` and is sourced from the session, never duplicated here
+ * (docs/DATABASE.md).
+ */
+export interface ProfileRow extends ProfileBaseRow {
+  phone: string | null;
+  address_line1: string | null;
+  address_line2: string | null;
+  address_city: string | null;
+  address_region: string | null;
+  address_country: string | null;
+  address_postal_code: string | null;
+}
 
-export interface AdminProfileRow extends ProfileRow {
+// Kept as a single string literal, not a concatenation: supabase-js infers the
+// row type from the literal, and `"a" + "b"` widens it to `string`, which
+// collapses the inferred result to an error type.
+const PROFILE_COLUMNS =
+  "id, first_name, last_name, avatar_url, phone, address_line1, address_line2, address_city, address_region, address_country, address_postal_code, status, created_at, updated_at";
+
+/**
+ * The admin listing's columns, deliberately **not** derived from
+ * `PROFILE_COLUMNS` any more (Phase 26-MB).
+ *
+ * Before this phase the two were the same string, so extending one silently
+ * extended the other. A user's phone number and home address are materially
+ * more sensitive than their display name, and nothing in this phase asked for
+ * them to appear in the admin user list — so the admin contract is left
+ * exactly as it was. Decoupling makes that a decision rather than an accident.
+ */
+const ADMIN_PROFILE_COLUMNS =
+  "id, first_name, last_name, avatar_url, status, created_at, updated_at, user_roles ( role )";
+
+export interface AdminProfileRow extends ProfileBaseRow {
   roles: string[];
 }
 
@@ -49,7 +89,7 @@ export async function updateProfile(
 }
 
 export interface PaginatedProfiles {
-  data: ProfileRow[];
+  data: ProfileBaseRow[];
   total: number;
 }
 
@@ -64,7 +104,7 @@ export interface ListProfilesFilters {
   status?: string;
 }
 
-interface RawAdminProfileRow extends ProfileRow {
+interface RawAdminProfileRow extends ProfileBaseRow {
   user_roles: { role: string }[];
 }
 

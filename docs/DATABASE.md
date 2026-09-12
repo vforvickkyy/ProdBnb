@@ -38,6 +38,18 @@ for this repo). Re-run `supabase link --project-ref <ref>` only if the link is e
 
 ### `public.profiles`
 
+> **Phase 26-MB — contact details.** The seven `phone`/`address_*` columns are the *user's own*
+> contact address, deliberately namespaced with an `address_` prefix: a bare `city` on a profile
+> row would read as a general attribute rather than one part of a postal address, and would collide
+> with the app's separate "default city" preference. The vocabulary otherwise mirrors
+> `public.locations` (`line1/line2/city/region/country/postal_code`). No latitude/longitude is
+> stored for a user address — geospatial work belongs to a later phase.
+>
+> They are writable by their owner because the Phase 26-MB migration adds them to the
+> **column-level UPDATE grant**. That grant, not RLS alone, is what keeps `status`, `id` and the
+> timestamps read-only for a normal user — see the grant note below.
+
+
 Application-level profile for a Supabase Auth user. **`id` is the same UUID as
 `auth.users.id`** — a 1:1 relationship, not a separate internal identifier. This is the standard
 Supabase pattern: it keeps "internal profile ID" and "Supabase auth user ID" as one stable value
@@ -49,6 +61,13 @@ instead of introducing a second ID to keep in sync.
 | `first_name` | `text` | nullable |
 | `last_name` | `text` | nullable |
 | `avatar_url` | `text` | nullable — a URL, not the image itself (R2 upload lands in Phase 3) |
+| `phone` | `text` | nullable — Phase 26-MB. The user's own contact number. **Not** synchronised with `auth.users.phone`, which only the phone-OTP flow populates |
+| `address_line1` | `text` | nullable — Phase 26-MB |
+| `address_line2` | `text` | nullable — Phase 26-MB |
+| `address_city` | `text` | nullable — Phase 26-MB |
+| `address_region` | `text` | nullable — Phase 26-MB |
+| `address_country` | `text` | nullable — Phase 26-MB |
+| `address_postal_code` | `text` | nullable — Phase 26-MB |
 | `status` | `text` | `active` \| `suspended` \| `deleted`, default `active` |
 | `created_at` | `timestamptz` | default `now()` |
 | `updated_at` | `timestamptz` | auto-maintained by trigger |
