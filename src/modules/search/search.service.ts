@@ -3,6 +3,30 @@ import { publicUrlFor } from "../../lib/r2";
 import { CatalogRef } from "../locations/locations.service";
 import { SearchLocationsQuery } from "./search.schema";
 
+/**
+ * The cheapest way to start booking a location, summarised for a discovery card
+ * (Phase 29 D1).
+ *
+ * Chosen by `search_locations()` in Postgres, never here: among active pricing
+ * rows with a positive amount, the cheapest amount wins when the location uses a
+ * single currency, and a deterministic unit order (hourly -> half_day -> day ->
+ * multi_day) decides otherwise — including when a location mixes currencies,
+ * where comparing minor units would be meaningless. Keeping the rule in one
+ * place is the point: web and Android inherit the same answer.
+ *
+ * Deliberately carries no formatted string, symbol or unit label. Clients own
+ * localisation; `booking_type` is the same enum `booking_options` already
+ * returns on location detail.
+ *
+ * A summary of configured pricing — never a quote. The booking flow remains
+ * authoritative for what anything actually costs.
+ */
+export interface StartingPrice {
+  amount_minor_units: number;
+  currency: string;
+  booking_type: "hourly" | "half_day" | "day" | "multi_day";
+}
+
 interface SearchLocationRow {
   id: string;
   title: string;
@@ -17,6 +41,7 @@ interface SearchLocationRow {
   categories: CatalogRef[];
   use_cases: CatalogRef[];
   primary_media_key: string | null;
+  starting_price: StartingPrice | null;
   created_at: string;
   total_count: number;
 }
@@ -34,6 +59,7 @@ export interface SearchLocationCard {
   categories: CatalogRef[];
   use_cases: CatalogRef[];
   primary_media_url: string | null;
+  starting_price: StartingPrice | null;
   created_at: string;
   distance_km?: number;
 }
@@ -57,6 +83,9 @@ function toCard(row: SearchLocationRow): SearchLocationCard {
     categories: row.categories,
     use_cases: row.use_cases,
     primary_media_url: row.primary_media_key ? publicUrlFor(row.primary_media_key) : null,
+    // Passed through untouched — the database decided which tier this is, and
+    // re-deriving or reformatting it here would create a second source of truth.
+    starting_price: row.starting_price ?? null,
     created_at: row.created_at,
     ...(row.distance_km !== null ? { distance_km: row.distance_km } : {}),
   };

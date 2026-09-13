@@ -1,5 +1,5 @@
 import request from "supertest";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { adminClient, createTestUser, deleteTestUser, TestUser } from "./setup";
 
@@ -328,5 +328,270 @@ describe("search & discovery", () => {
       const res = await request(app).get("/v1/locations").query({ capacity_min: 100, capacity_max: 10 });
       expect(res.status).toBe(400);
     });
+  });
+});
+
+// ============================================================================
+// Phase 29 D1 — starting price on the discovery card
+//
+// The rule lives in search_locations(): among ACTIVE pricing rows with a
+// POSITIVE amount, the cheapest amount wins when the location uses one
+// currency, and a deterministic unit order (hourly -> half_day -> day ->
+// multi_day) decides otherwise — including across currencies, where comparing
+// minor units would be meaningless.
+// ============================================================================
+
+type BookingType = "hourly" | "half_day" | "day" | "multi_day";
+
+interface PricingSeed {
+  booking_type: BookingType;
+  amount_minor_units: number;
+  currency?: string;
+  is_active?: boolean;
+}
+
+async function seedPricing(locationId: string, rows: PricingSeed[]): Promise<void> {
+  const { error } = await adminClient.from("location_pricing").insert(
+    rows.map((r) => ({
+      location_id: locationId,
+      booking_type: r.booking_type,
+      amount_minor_units: r.amount_minor_units,
+      currency: r.currency ?? "INR",
+      is_active: r.is_active ?? true,
+      ...(r.booking_type === "half_day" ? { half_day_duration_hours: 5 } : {}),
+    }))
+  );
+  if (error) throw error;
+}
+
+interface StartingPriceBody {
+  amount_minor_units: number;
+  currency: string;
+  booking_type: BookingType;
+}
+
+async function startingPriceOf(locationId: string): Promise<StartingPriceBody | null> {
+  const res = await request(app).get("/v1/locations").query({ search: locationId, pageSize: 50 });
+  expect(res.status).toBe(200);
+  const card = res.body.data.find((l: { id: string }) => l.id === locationId);
+  expect(card, `location ${locationId} missing from results`).toBeDefined();
+  return card.starting_price as StartingPriceBody | null;
+}
+
+describe("starting price (Phase 29 D1)", () => {
+  let host: TestUser;
+  let admin: TestUser;
+
+  // Each location's title embeds its own id so `search` isolates it — these
+  // tests must not depend on the shared fixtures above, or on each other.
+  async function seedPriced(label: string, rows: PricingSeed[]): Promise<string> {
+    const id = await seedLocation(host, admin, {
+      title: `D1 ${label}`,
+      description: `Phase 29 D1 pricing fixture: ${label}`,
+      city: "Pune",
+      country: "India",
+    });
+    // Re-title with the id so the full-text search above can target exactly one row.
+    const { error } = await adminClient.from("locations").update({ title: `D1 ${label} ${id}` }).eq("id", id);
+    if (error) throw error;
+    if (rows.length > 0) await seedPricing(id, rows);
+    return id;
+  }
+
+  beforeAll(async () => {
+    host = await createTestUser();
+    admin = await createTestUser();
+    await grantHostRole(host);
+  });
+
+  afterAll(async () => {
+    await deleteTestUser(host.id);
+    await deleteTestUser(admin.id);
+  });
+
+  it("returns amount, currency and booking_type for a single active tier", async () => {
+    const id = await seedPriced("single", [{ booking_type: "day", amount_minor_units: 1500000 }]);
+    expect(await startingPriceOf(id)).toEqual({
+      amount_minor_units: 1500000,
+      currency: "INR",
+      booking_type: "day",
+    });
+  });
+
+  it("picks the cheapest positive amount when tiers share a currency", async () => {
+    const id = await seedPriced("cheapest", [
+      { booking_type: "hourly", amount_minor_units: 200000 },
+      { booking_type: "half_day", amount_minor_units: 800000 },
+      { booking_type: "day", amount_minor_units: 1500000 },
+    ]);
+    const price = await startingPriceOf(id);
+    expect(price?.booking_type).toBe("hourly");
+    expect(price?.amount_minor_units).toBe(200000);
+  });
+
+  // The case where "cheapest amount" and "smallest unit" disagree. Pins the
+  // approved rule so it cannot silently drift back to unit-order-only.
+  it("prefers the cheaper larger unit when a smaller unit costs more", async () => {
+    const id = await seedPriced("divergence", [
+      { booking_type: "hourly", amount_minor_units: 500000 },
+      { booking_type: "day", amount_minor_units: 300000 },
+    ]);
+    const price = await startingPriceOf(id);
+    expect(price?.booking_type).toBe("day");
+    expect(price?.amount_minor_units).toBe(300000);
+  });
+
+  it("breaks an equal-price tie by unit order", async () => {
+    const id = await seedPriced("tie", [
+      { booking_type: "day", amount_minor_units: 400000 },
+      { booking_type: "hourly", amount_minor_units: 400000 },
+    ]);
+    expect((await startingPriceOf(id))?.booking_type).toBe("hourly");
+  });
+
+  it("ignores an inactive tier even when it is cheaper", async () => {
+    const id = await seedPriced("inactive-cheaper", [
+      { booking_type: "hourly", amount_minor_units: 100000, is_active: false },
+      { booking_type: "day", amount_minor_units: 900000 },
+    ]);
+    const price = await startingPriceOf(id);
+    expect(price?.booking_type).toBe("day");
+    expect(price?.amount_minor_units).toBe(900000);
+  });
+
+  it("returns null when every tier is inactive", async () => {
+    const id = await seedPriced("all-inactive", [
+      { booking_type: "hourly", amount_minor_units: 100000, is_active: false },
+      { booking_type: "day", amount_minor_units: 900000, is_active: false },
+    ]);
+    expect(await startingPriceOf(id)).toBeNull();
+  });
+
+  it("returns null when the location has no pricing at all", async () => {
+    const id = await seedPriced("no-pricing", []);
+    expect(await startingPriceOf(id)).toBeNull();
+  });
+
+  it("never lets a zero-amount tier become the starting price", async () => {
+    const id = await seedPriced("zero-plus-positive", [
+      { booking_type: "hourly", amount_minor_units: 0 },
+      { booking_type: "day", amount_minor_units: 1200000 },
+    ]);
+    const price = await startingPriceOf(id);
+    expect(price?.amount_minor_units).toBe(1200000);
+    expect(price?.booking_type).toBe("day");
+  });
+
+  it("returns null when the only tiers are zero-amount", async () => {
+    const id = await seedPriced("zero-only", [{ booking_type: "hourly", amount_minor_units: 0 }]);
+    expect(await startingPriceOf(id)).toBeNull();
+  });
+
+  // USD 100 is not "less than" INR 3000. No conversion, no invented rate —
+  // unit order answers instead.
+  it("does not compare amounts across currencies, and falls back to unit order", async () => {
+    const id = await seedPriced("mixed-currency", [
+      { booking_type: "hourly", amount_minor_units: 10000, currency: "USD" },
+      { booking_type: "day", amount_minor_units: 300000, currency: "INR" },
+    ]);
+    const price = await startingPriceOf(id);
+    expect(price?.booking_type).toBe("hourly");
+    expect(price?.currency).toBe("USD");
+    expect(price?.amount_minor_units).toBe(10000);
+  });
+
+  it("uses unit order across currencies even with no hourly tier", async () => {
+    const id = await seedPriced("mixed-no-hourly", [
+      { booking_type: "day", amount_minor_units: 100000, currency: "USD" },
+      { booking_type: "half_day", amount_minor_units: 900000, currency: "INR" },
+    ]);
+    const price = await startingPriceOf(id);
+    expect(price?.booking_type).toBe("half_day");
+    expect(price?.currency).toBe("INR");
+  });
+
+  it("returns a non-INR currency verbatim", async () => {
+    const id = await seedPriced("gbp", [{ booking_type: "day", amount_minor_units: 25000, currency: "GBP" }]);
+    expect((await startingPriceOf(id))?.currency).toBe("GBP");
+  });
+
+  it("keeps an unpublished location out of the results even when it is priced", async () => {
+    const id = await seedLocation(host, admin, {
+      title: "D1 unpublished priced",
+      city: "Pune",
+      country: "India",
+      status: "draft",
+    });
+    await seedPricing(id, [{ booking_type: "day", amount_minor_units: 500000 }]);
+
+    const res = await request(app).get("/v1/locations").query({ search: "D1 unpublished priced", pageSize: 50 });
+    expect(res.status).toBe(200);
+    expect(ids(res)).not.toContain(id);
+  });
+
+  it("adds starting_price without disturbing any existing card field", async () => {
+    const id = await seedPriced("card-shape", [{ booking_type: "day", amount_minor_units: 700000 }]);
+    const res = await request(app).get("/v1/locations").query({ search: id, pageSize: 5 });
+    const card = res.body.data.find((l: { id: string }) => l.id === id);
+
+    for (const key of [
+      "id",
+      "title",
+      "excerpt",
+      "city",
+      "region",
+      "country",
+      "latitude",
+      "longitude",
+      "capacity",
+      "categories",
+      "use_cases",
+      "primary_media_url",
+      "created_at",
+      "starting_price",
+    ]) {
+      expect(card, `missing ${key}`).toHaveProperty(key);
+    }
+    // The card stays a card — no pricing array, no booking_options leak.
+    expect(card).not.toHaveProperty("booking_options");
+    expect(card).not.toHaveProperty("description");
+  });
+
+  it("leaves pagination and total intact", async () => {
+    const first = await request(app).get("/v1/locations").query({ page: 1, pageSize: 3 });
+    const second = await request(app).get("/v1/locations").query({ page: 2, pageSize: 3 });
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.data).toHaveLength(3);
+    expect(first.body.meta.total).toBe(second.body.meta.total);
+    expect(first.body.meta.total).toBeGreaterThan(3);
+    expect(ids(first).some((id) => ids(second).includes(id))).toBe(false);
+  });
+
+  it("leaves every sort mode working", async () => {
+    for (const sort of ["newest", "relevant"]) {
+      const res = await request(app).get("/v1/locations").query({ sort, pageSize: 5 });
+      expect(res.status, sort).toBe(200);
+      expect(Array.isArray(res.body.data)).toBe(true);
+    }
+    const nearest = await request(app)
+      .get("/v1/locations")
+      .query({ sort: "nearest", lat: 18.5204, lng: 73.8567, pageSize: 5 });
+    expect(nearest.status).toBe(200);
+  });
+
+  // The whole point of putting this in the RPC: one round trip regardless of
+  // how many cards come back.
+  it("still issues exactly one database call for a full page of cards", async () => {
+    const { anonClient } = await import("../src/lib/supabase");
+    const spy = vi.spyOn(anonClient, "rpc");
+    try {
+      const res = await request(app).get("/v1/locations").query({ pageSize: 20 });
+      expect(res.status).toBe(200);
+      expect(res.body.data.length).toBeGreaterThan(1);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
