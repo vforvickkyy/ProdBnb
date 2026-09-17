@@ -210,25 +210,32 @@ describe("media upload", () => {
       expect(res.body.data.map((m: { id: string }) => m.id)).toEqual([mediaId, secondMediaId]);
     });
 
-    it("lets the host reorder media", async () => {
-      // PATCH sets a raw position (no automatic sibling renumbering — kept
-      // simple, per the plan), so a clean swap means moving both items.
-      const first = await request(app)
-        .patch(`/v1/locations/${locationId}/media/${secondMediaId}`)
+    it("lets the host reorder media, in one atomic request", async () => {
+      // Phase 29.5: the swap is one request stating the gallery's complete order. It used to be two
+      // independent PATCHes that left both rows on position 0 in between — the single-row endpoint
+      // is now removed.
+      const res = await request(app)
+        .put(`/v1/locations/${locationId}/media/order`)
         .set(authHeader(host))
-        .send({ position: 0 });
-      expect(first.status).toBe(200);
-      expect(first.body.data.position).toBe(0);
+        .send({ ordered_ids: [secondMediaId, mediaId] });
 
-      const second = await request(app)
-        .patch(`/v1/locations/${locationId}/media/${mediaId}`)
-        .set(authHeader(host))
-        .send({ position: 1 });
-      expect(second.status).toBe(200);
-      expect(second.body.data.position).toBe(1);
+      expect(res.status).toBe(200);
+      expect(res.body.data.map((m: { id: string }) => m.id)).toEqual([secondMediaId, mediaId]);
+      // Contiguous and 0-based, with no intermediate state ever visible.
+      expect(res.body.data.map((m: { position: number }) => m.position)).toEqual([0, 1]);
 
       const list = await request(app).get(`/v1/locations/${locationId}/media`);
       expect(list.body.data.map((m: { id: string }) => m.id)).toEqual([secondMediaId, mediaId]);
+    });
+
+    it("no longer exposes the single-item position PATCH", async () => {
+      const res = await request(app)
+        .patch(`/v1/locations/${locationId}/media/${mediaId}`)
+        .set(authHeader(host))
+        .send({ position: 0 });
+
+      expect(res.status).toBe(404);
+      expect(res.body.error.code).toBe("NOT_FOUND");
     });
 
     it("does not let another host delete this media", async () => {
@@ -237,12 +244,17 @@ describe("media upload", () => {
     });
 
     it("lets an admin manage media on a location they don't own", async () => {
+      // The authorization rule under test is unchanged; only the mechanism moved to the atomic
+      // reorder now that the single-row PATCH is gone. The gallery currently reads
+      // [secondMediaId, mediaId] from the reorder above.
       const res = await request(app)
-        .patch(`/v1/locations/${locationId}/media/${mediaId}`)
+        .put(`/v1/locations/${locationId}/media/order`)
         .set(authHeader(admin))
-        .send({ position: 5 });
+        .send({ ordered_ids: [mediaId, secondMediaId] });
+
       expect(res.status).toBe(200);
-      expect(res.body.data.position).toBe(5);
+      expect(res.body.data.map((m: { id: string }) => m.id)).toEqual([mediaId, secondMediaId]);
+      expect(res.body.data.map((m: { position: number }) => m.position)).toEqual([0, 1]);
     });
 
     it("lets the owning host delete their media, removing both the R2 object and the row", async () => {

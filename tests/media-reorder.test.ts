@@ -42,8 +42,14 @@ async function createDraftLocation(owner: TestUser, title = "Reorder Test Locati
   return res.body.data.id as string;
 }
 
-/** Authorize → simulate the client's PUT to R2 → complete. Returns the media id. */
-async function addPhoto(owner: TestUser, locationId: string): Promise<string> {
+/**
+ * Authorize → simulate the client's PUT to R2 → complete. Returns the media id.
+ *
+ * `position` is the complete endpoint's own optional field. Since Phase 29.5 removed the single-row
+ * PATCH, it is the only way a caller can place a row at a specific position — which is what the
+ * not-0-based test below needs.
+ */
+async function addPhoto(owner: TestUser, locationId: string, position?: number): Promise<string> {
   const upload = await request(app).post(`/v1/locations/${locationId}/media/upload`).set(authHeader(owner)).send(PHOTO);
   expect(upload.status).toBe(201);
   const mediaId = upload.body.data.media_id as string;
@@ -56,7 +62,7 @@ async function addPhoto(owner: TestUser, locationId: string): Promise<string> {
   const done = await request(app)
     .post(`/v1/locations/${locationId}/media/${mediaId}/complete`)
     .set(authHeader(owner))
-    .send({});
+    .send(position === undefined ? {} : { position });
   expect(done.status).toBe(201);
   return mediaId;
 }
@@ -187,12 +193,17 @@ describe("Phase 29 B2.5-a: PUT /v1/locations/:id/media/order", () => {
       // Exactly the live staging shape: HLV Film City's only photo sits at
       // position 1, so nothing may assume position 0 means "cover".
       const locationId = await createDraftLocation(host);
-      const [a, b] = await addPhotos(host, locationId, 2);
 
-      // Push both out of the 0-based range using the legacy single-row PATCH,
-      // which B2.5-a deliberately leaves in place.
-      await request(app).patch(`/v1/locations/${locationId}/media/${a}`).set(authHeader(host)).send({ position: 7 });
-      await request(app).patch(`/v1/locations/${locationId}/media/${b}`).set(authHeader(host)).send({ position: 9 });
+      // Phase 29.5: built with explicit positions on complete. This used to push the rows out of
+      // the 0-based range with the legacy single-row PATCH, which no longer exists — and because
+      // that PATCH would now simply 404, leaving the gallery at 0,1, the test would have gone on
+      // passing while testing nothing at all.
+      const a = await addPhoto(host, locationId, 7);
+      const b = await addPhoto(host, locationId, 9);
+
+      // Proves the precondition rather than assuming it.
+      const before = await listMedia(host, locationId);
+      expect(positionsOf(before.body)).toEqual([7, 9]);
 
       const res = await reorder(host, locationId, [b, a]);
 
@@ -406,9 +417,11 @@ describe("Phase 29 B2.5-a: PUT /v1/locations/:id/media/order", () => {
       expect(positionsOf(list.body)).toEqual([0, 1, 2]);
     });
 
-    it("the legacy single-row PATCH endpoint still works and is unchanged", async () => {
-      // B2.5-a must not disturb it: the shipped iOS build still reorders this
-      // way, which is why B2.5-f's uniqueness index is not part of this subphase.
+    it("the legacy single-row PATCH endpoint is gone (Phase 29.5)", async () => {
+      // It used to set one row's raw position and renumber nothing else, so a swap meant two
+      // independent requests with a duplicate position in between. That is exactly the shape a
+      // UNIQUE (location_id, position) index cannot tolerate, and the B2.5-e audit established
+      // that no client calls it any more. Atomic reorder is the supported mechanism.
       const locationId = await createDraftLocation(host);
       const [a, b] = await addPhotos(host, locationId, 2);
 
@@ -417,12 +430,13 @@ describe("Phase 29 B2.5-a: PUT /v1/locations/:id/media/order", () => {
         .set(authHeader(host))
         .send({ position: 0 });
 
-      expect(res.status).toBe(200);
-      expect(res.body.data.position).toBe(0);
-      // Two rows now share position 0 — still permitted, because the uniqueness
-      // index is deliberately deferred to B2.5-f.
-      const _ = await listMedia(host, locationId);
-      expect(_.status).toBe(200);
+      expect(res.status).toBe(404);
+      expect(res.body.error.code).toBe("NOT_FOUND");
+
+      // The route is gone, so nothing moved and no duplicate position was created.
+      const after = await listMedia(host, locationId);
+      expect(idsOf(after.body)).toEqual([a, b]);
+      expect(positionsOf(after.body)).toEqual([0, 1]);
     });
   });
 

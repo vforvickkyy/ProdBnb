@@ -436,9 +436,17 @@ recording it.
 
 Request: `{ "position": 0 }` (optional — defaults to appended-at-the-end)
 
-Response (`201`): `{ "data": { "id": "a1b2...", "media_type": "photo", "url": "https://...", "position": 0, "created_at": "...", "updated_at": "..." } }`
+Response (`201`) on the call that records the row; **`200`** for an idempotent replay of a media id
+already recorded against this location, returning that row exactly as first stored (no second R2
+check, no position change, no timestamp touched):
+`{ "data": { "id": "a1b2...", "media_type": "photo", "url": "https://...", "position": 0, "created_at": "...", "updated_at": "..." } }`
 
-- `404 NOT_FOUND` if nothing has actually been uploaded to the expected object yet.
+Appending is concurrency-safe (Phase 29.5): the next position is resolved and the row inserted under
+a per-location lock, so two uploads completing at the same moment cannot be given the same position.
+
+- `404 NOT_FOUND` if nothing has actually been uploaded to the expected object yet, **or** if the
+  media id is already recorded against a different location — deliberately the same response body in
+  both cases, so a media id cannot be probed for existence.
 - `400 VALIDATION_ERROR` if the uploaded object's real content-type/size don't pass validation.
 
 ### `GET /v1/locations/:id/media`
@@ -446,11 +454,30 @@ Response (`201`): `{ "data": { "id": "a1b2...", "media_type": "photo", "url": "h
 Optional authentication — same visibility as `GET /v1/locations/:id` (published is public,
 otherwise owner/admin only). Returns the location's media, ordered by `position`.
 
-### `PATCH /v1/locations/:id/media/:mediaId`
+### `PUT /v1/locations/:id/media/order`
 
-Requires authentication (owner or admin). Only `{ "position": <integer> }` is accepted — nothing
-else about a media item is mutable after creation. Sets the raw position; it does not
-automatically renumber sibling items, so a clean reorder means patching every item that moved.
+Requires authentication (owner or admin). **The supported way to reorder a gallery.**
+
+Request: `{ "ordered_ids": ["a1b2...", "c3d4...", "e5f6..."] }`
+
+`ordered_ids` must be the gallery's **complete** order — every photo in it, exactly once. The
+backend owns the renumbering: it renumbers to exactly `0..n-1` in the order given, in one
+transaction, and returns the resulting rows. Nothing is ever left partially renumbered, and the
+response cannot disagree with what was committed. Sending the same list twice is a no-op.
+
+Response (`200`): the location's media in the new order, with positions `0..n-1`.
+
+- `400 VALIDATION_ERROR` if `ordered_ids` omits a photo, repeats one, contains an id that does not
+  belong to this gallery, is empty, or exceeds 100 ids (a request-size guard, not a limit on how
+  many photos a location may have). The "unknown id" message deliberately does not reveal whether
+  that id exists somewhere else.
+- `404 NOT_FOUND` if the location isn't visible to the caller; `403 FORBIDDEN` if it is visible but
+  not theirs.
+
+> **Removed in Phase 29.5:** `PATCH /v1/locations/:id/media/:mediaId`, which set one item's raw
+> position and renumbered no siblings. Expressing even a two-item swap took two requests and left
+> the gallery on a duplicate position in between. It now returns `404 NOT_FOUND` like any other
+> unknown route. There is deliberately no single-item replacement — use the atomic reorder above.
 
 ### `DELETE /v1/locations/:id/media/:mediaId`
 

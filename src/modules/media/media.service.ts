@@ -89,20 +89,18 @@ export async function requestUpload(
   };
 }
 
-async function nextPosition(supabase: SupabaseClient, locationId: string): Promise<number> {
-  const { data, error } = await supabase
-    .from("location_media")
-    .select("position")
-    .eq("location_id", locationId)
-    .order("position", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) {
-    throw error;
-  }
-  return data ? data.position + 1 : 0;
-}
+/**
+ * Phase 29.5: `nextPosition()` is gone, and deliberately has no replacement here.
+ *
+ * It read `max(position)` in one statement and the insert used it in another, with no lock in
+ * between. Under READ COMMITTED two completions racing for the same location both read the same
+ * maximum and both inserted the same position — and with iOS uploading two photos at a time, that
+ * race is the ordinary multi-photo path rather than an edge case.
+ *
+ * Reading and inserting are now one statement sequence inside `record_location_media()`, serialised
+ * per location by a transaction-scoped advisory lock. Computing the position in TypeScript cannot be
+ * made safe, because the supabase client has no transaction to hold a lock across.
+ */
 
 /**
  * The outcome of a completion, so the route can answer 201 for a genuine first
@@ -195,28 +193,27 @@ export async function completeUpload(
     throw new ValidationError(`Uploaded file exceeds the size limit for ${mediaType}.`);
   }
 
-  const resolvedPosition = position ?? (await nextPosition(supabase, locationId));
+  // Phase 29.5: the position is resolved and the row inserted inside one function call, under a
+  // per-location advisory lock, so two concurrent completions cannot be handed the same position.
+  // `position` is passed straight through — an explicitly requested one is still honoured verbatim.
+  //
+  // Still adminClient, not the caller's own scoped client (Phase 12: `location_media` no longer
+  // grants authenticated INSERT at all) -- otherwise a host could bypass the headObject()
+  // verification above entirely via direct PostgREST and register a row pointing at any
+  // storage_key, including another location's real, already-uploaded media. `record_location_media`
+  // is granted to service_role alone for the same reason. Ownership was already fully checked by
+  // assertCanManageLocation() above.
+  const { data, error } = await adminClient.rpc("record_location_media", {
+    _media_id: mediaId,
+    _location_id: locationId,
+    _media_type: mediaType,
+    _storage_key: key,
+    _position: position ?? null,
+  });
 
-  // adminClient, not the caller's own scoped client (Phase 12: `location_media`
-  // no longer grants authenticated INSERT at all) -- otherwise a host could
-  // bypass the headObject() verification above entirely via direct PostgREST
-  // and register a row pointing at any storage_key, including another
-  // location's real, already-uploaded media. Ownership was already fully
-  // checked by assertCanManageLocation() above.
-  const { data, error } = await adminClient
-    .from("location_media")
-    .insert({
-      id: mediaId,
-      location_id: locationId,
-      media_type: mediaType,
-      storage_key: key,
-      position: resolvedPosition,
-    })
-    .select(MEDIA_COLUMNS)
-    .single();
-
-  if (!error && data) {
-    return { item: toPublicMediaItem(data), created: true };
+  const [insertedRow] = (data ?? []) as RawLocationMediaRow[];
+  if (!error && insertedRow) {
+    return { item: toPublicMediaItem(insertedRow), created: true };
   }
 
   // The lookup above found nothing, so a primary-key collision here means a concurrent request
@@ -259,33 +256,19 @@ export async function listMedia(supabase: SupabaseClient, locationId: string): P
   return (data ?? []).map(toPublicMediaItem);
 }
 
-export async function updateMediaPosition(
-  supabase: SupabaseClient,
-  callerId: string,
-  isAdmin: boolean,
-  locationId: string,
-  mediaId: string,
-  position: number
-): Promise<PublicMediaItem> {
-  await assertCanManageLocation(supabase, callerId, isAdmin, locationId);
-
-  const { data, error } = await supabase
-    .from("location_media")
-    .update({ position })
-    .eq("id", mediaId)
-    .eq("location_id", locationId)
-    .select(MEDIA_COLUMNS)
-    .maybeSingle();
-
-  if (error) {
-    throw error;
-  }
-  if (!data) {
-    throw new NotFoundError("Media not found for this location.");
-  }
-
-  return toPublicMediaItem(data);
-}
+/**
+ * Phase 29.5: `updateMediaPosition()` and its `PATCH /v1/locations/:id/media/:mediaId` route are
+ * REMOVED. Do not reintroduce a single-item position mutation.
+ *
+ * It set one row's raw position and renumbered no siblings, so expressing even a two-item swap
+ * meant two independent requests that were transiently -- and, if the second never arrived,
+ * permanently -- both on the same position. `reorderMedia()` below states the gallery's complete
+ * order in one transaction and is the supported ordering mechanism.
+ *
+ * `authenticated` deliberately KEEPS its `UPDATE ("position")` grant on location_media: that grant
+ * is what authorises `reorder_location_media()`, which is SECURITY INVOKER. Revoking it because the
+ * PATCH route is gone would break the atomic reorder.
+ */
 
 /**
  * Phase 29 B2.5-a: atomically renumbers the whole gallery to exactly 0..n-1 in

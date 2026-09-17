@@ -7,9 +7,8 @@ import {
   LocationMediaParams,
   ReorderMediaInput,
   RequestUploadInput,
-  UpdateMediaInput,
 } from "./media.schema";
-import { completeUpload, deleteMedia, listMedia, reorderMedia, requestUpload, updateMediaPosition } from "./media.service";
+import { completeUpload, deleteMedia, listMedia, reorderMedia, requestUpload } from "./media.service";
 
 async function isCallerAdmin(req: Request): Promise<boolean> {
   return callerHasRole(req.supabase!, req.user!.id, "admin");
@@ -54,14 +53,6 @@ export async function putMediaOrder(req: Request, res: Response): Promise<void> 
   const { ordered_ids } = req.valid!.body as ReorderMediaInput;
   const isAdmin = await isCallerAdmin(req);
   const media = await reorderMedia(req.supabase!, req.user!.id, isAdmin, id, ordered_ids);
-  ok(res, media);
-}
-
-export async function patchMedia(req: Request, res: Response): Promise<void> {
-  const { id, mediaId } = req.valid!.params as LocationMediaParams;
-  const { position } = req.valid!.body as UpdateMediaInput;
-  const isAdmin = await isCallerAdmin(req);
-  const media = await updateMediaPosition(req.supabase!, req.user!.id, isAdmin, id, mediaId, position);
   ok(res, media);
 }
 

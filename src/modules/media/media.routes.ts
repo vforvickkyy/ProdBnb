@@ -5,7 +5,6 @@ import { validate } from "../../middleware/validate";
 import {
   deleteMediaHandler,
   getMedia,
-  patchMedia,
   postCompleteUpload,
   postRequestUpload,
   putMediaOrder,
@@ -16,7 +15,6 @@ import {
   locationMediaParamsSchema,
   reorderMediaSchema,
   requestUploadSchema,
-  updateMediaSchema,
 } from "./media.schema";
 
 export const mediaRouter = Router();
@@ -57,13 +55,6 @@ mediaRouter.put(
   requireAuth,
   validate({ params: locationIdOnlyParamSchema, body: reorderMediaSchema }),
   putMediaOrder
-);
-
-mediaRouter.patch(
-  "/locations/:id/media/:mediaId",
-  requireAuth,
-  validate({ params: locationMediaParamsSchema, body: updateMediaSchema }),
-  patchMedia
 );
 
 mediaRouter.delete(

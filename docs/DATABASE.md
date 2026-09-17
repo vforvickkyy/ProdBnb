@@ -293,6 +293,15 @@ derived from a client-supplied filename.
    re-checked, and only then is the `location_media` row inserted (`id = mediaId`, so the id the
    client already has becomes the row's real id).
 
+   Since **Phase 29.5** that insert goes through `public.record_location_media()`, which resolves
+   the new row's `position` and inserts it under a per-location transaction-scoped advisory lock.
+   Previously the position came from a separate `select max(position)` in its own transaction, so
+   two completions racing for the same location both read the same maximum and both wrote the same
+   position. Harmless while positions may repeat — but iOS uploads two photos at a time, so it was
+   the ordinary path, not an edge case, and it would have turned into a bare `500` the moment a
+   `UNIQUE (location_id, position)` index existed. Replays still return the already-recorded row
+   (`200`) rather than inserting twice.
+
 No "pending upload" table exists between steps 1 and 3 — the key is fully deterministic from
 `(location_id, media_id)`, and the only way real bytes can land at that exact key is through a
 presigned `PUT` the backend only ever issues after verifying ownership, so there's nothing worth
@@ -1328,7 +1337,14 @@ draft directly via PostgREST, bypassing admin moderation entirely, or self-clear
 **`location_media`** — `authenticated` loses `INSERT` entirely (kept: `UPDATE (position)` for
 reordering, and `DELETE`, both already ownership-gated and unaffected). Only
 `completeUpload()` (`media.service.ts`) may create a row now, via `adminClient`, and only after
-its existing `headObject()` verification against the real uploaded R2 object. Before this, a host
+its existing `headObject()` verification against the real uploaded R2 object.
+
+> **Phase 29.5 — do not revoke `UPDATE (position)` just because the single-row `PATCH` endpoint is
+> gone.** That grant is now what authorises `reorder_location_media()`, which is `SECURITY INVOKER`
+> and therefore runs with the caller's own privileges. Revoking it would break the atomic reorder,
+> which is the *only* remaining way to reorder a gallery. The new
+> `record_location_media()` is granted to `service_role` alone and deliberately does **not** hand
+> `authenticated` back the INSERT this section took away. Before this, a host
 could insert a `location_media` row directly, pointing `storage_key` at any string — including
 another location's real, already-uploaded object (its key is derivable from that location's own
 public media URLs) — bypassing the content-type/size verification `completeUpload()` performs and

@@ -57,13 +57,15 @@ export const reorderMediaSchema = z
 
 export type ReorderMediaInput = z.infer<typeof reorderMediaSchema>;
 
-export const updateMediaSchema = z
-  .object({
-    position: z.number().int().min(0),
-  })
-  .strict();
-
-export type UpdateMediaInput = z.infer<typeof updateMediaSchema>;
+/**
+ * Phase 29.5: `updateMediaSchema` is REMOVED along with
+ * `PATCH /v1/locations/:id/media/:mediaId`.
+ *
+ * It accepted a single raw `position` and renumbered nothing else, so a two-item swap required two
+ * independent requests and sat on a duplicate position in between. `reorderMediaSchema` above states
+ * the gallery's complete order in one request and is the supported ordering mechanism. Do not
+ * reintroduce a single-item position endpoint.
+ */
 
 const uuid = z.string().uuid();
 
