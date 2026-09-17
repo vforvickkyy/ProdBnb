@@ -87,8 +87,14 @@ export interface HostPublicSummary {
   avatar_url: string | null;
 }
 
-/** Raw shape as stored/queried — never returned to a client (storage_key is an internal R2 detail). */
-interface RawLocationMediaRow {
+/**
+ * Raw shape as stored/queried — never returned to a client (storage_key is an internal R2 detail).
+ *
+ * Exported since Phase 29 B2.5-a: `reorder_location_media()` returns
+ * `setof public.location_media`, so the media service maps those raw rows through
+ * `toPublicMediaItem` exactly as `flattenDetail` already does here.
+ */
+export interface RawLocationMediaRow {
   id: string;
   media_type: "photo" | "video";
   storage_key: string;

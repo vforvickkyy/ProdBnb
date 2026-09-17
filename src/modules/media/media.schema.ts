@@ -28,6 +28,35 @@ export const completeUploadSchema = z
 
 export type CompleteUploadInput = z.infer<typeof completeUploadSchema>;
 
+/**
+ * Phase 29 B2.5-a: `PUT /v1/locations/:id/media/order`.
+ *
+ * `ordered_ids` must be the gallery's COMPLETE order, not a partial edit
+ * (approved decision Q1) — a partial list makes "where do the omitted photos
+ * go?" ambiguous, and the client always holds the full list anyway. Set
+ * equality against the real gallery is enforced in the service layer, which
+ * owns the 404-vs-403-vs-400 distinction; this schema covers only the shape.
+ *
+ * The 100 cap is a technical/DoS guard (approved decision Q2), not a product
+ * limit on how many photos a location may have — no such limit exists.
+ *
+ * Duplicates are rejected here rather than in the service so the caller gets
+ * the standard zod `fieldErrors` detail shape every other 400 uses.
+ */
+export const MAX_REORDER_IDS = 100;
+
+export const reorderMediaSchema = z
+  .object({
+    ordered_ids: z.array(z.string().uuid()).min(1).max(MAX_REORDER_IDS),
+  })
+  .strict()
+  .refine((data) => new Set(data.ordered_ids).size === data.ordered_ids.length, {
+    message: "ordered_ids must not contain duplicate ids.",
+    path: ["ordered_ids"],
+  });
+
+export type ReorderMediaInput = z.infer<typeof reorderMediaSchema>;
+
 export const updateMediaSchema = z
   .object({
     position: z.number().int().min(0),

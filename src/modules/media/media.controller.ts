@@ -1,8 +1,15 @@
 import { Request, Response } from "express";
 import { callerHasRole } from "../../middleware/requireRole";
 import { created, ok } from "../../utils/respond";
-import { CompleteUploadInput, LocationIdOnlyParam, LocationMediaParams, RequestUploadInput, UpdateMediaInput } from "./media.schema";
-import { completeUpload, deleteMedia, listMedia, requestUpload, updateMediaPosition } from "./media.service";
+import {
+  CompleteUploadInput,
+  LocationIdOnlyParam,
+  LocationMediaParams,
+  ReorderMediaInput,
+  RequestUploadInput,
+  UpdateMediaInput,
+} from "./media.schema";
+import { completeUpload, deleteMedia, listMedia, reorderMedia, requestUpload, updateMediaPosition } from "./media.service";
 
 async function isCallerAdmin(req: Request): Promise<boolean> {
   return callerHasRole(req.supabase!, req.user!.id, "admin");
@@ -16,17 +23,37 @@ export async function postRequestUpload(req: Request, res: Response): Promise<vo
   created(res, authorization);
 }
 
+/**
+ * Phase 29 B2.5-b: **201 for a genuine first record, 200 for an idempotent replay.**
+ *
+ * A replay is not a creation, so it must not keep claiming 201. The body is identical either way —
+ * the same `PublicMediaItem` the normal completion returns, in the module's existing `{ data }`
+ * envelope.
+ */
 export async function postCompleteUpload(req: Request, res: Response): Promise<void> {
   const { id, mediaId } = req.valid!.params as LocationMediaParams;
   const { position } = req.valid!.body as CompleteUploadInput;
   const isAdmin = await isCallerAdmin(req);
-  const media = await completeUpload(req.supabase!, req.user!.id, isAdmin, id, mediaId, position);
-  created(res, media);
+  const result = await completeUpload(req.supabase!, req.user!.id, isAdmin, id, mediaId, position);
+  if (result.created) {
+    created(res, result.item);
+    return;
+  }
+  ok(res, result.item);
 }
 
 export async function getMedia(req: Request, res: Response): Promise<void> {
   const { id } = req.valid!.params as LocationIdOnlyParam;
   const media = await listMedia(req.supabase!, id);
+  ok(res, media);
+}
+
+/** Phase 29 B2.5-a. Returns the resulting order, 200, in the module's existing `{ data }` envelope. */
+export async function putMediaOrder(req: Request, res: Response): Promise<void> {
+  const { id } = req.valid!.params as LocationIdOnlyParam;
+  const { ordered_ids } = req.valid!.body as ReorderMediaInput;
+  const isAdmin = await isCallerAdmin(req);
+  const media = await reorderMedia(req.supabase!, req.user!.id, isAdmin, id, ordered_ids);
   ok(res, media);
 }
 

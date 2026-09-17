@@ -2,11 +2,19 @@ import { Router } from "express";
 import { requireAuth } from "../../middleware/auth";
 import { optionalAuth } from "../../middleware/optionalAuth";
 import { validate } from "../../middleware/validate";
-import { deleteMediaHandler, getMedia, patchMedia, postCompleteUpload, postRequestUpload } from "./media.controller";
+import {
+  deleteMediaHandler,
+  getMedia,
+  patchMedia,
+  postCompleteUpload,
+  postRequestUpload,
+  putMediaOrder,
+} from "./media.controller";
 import {
   completeUploadSchema,
   locationIdOnlyParamSchema,
   locationMediaParamsSchema,
+  reorderMediaSchema,
   requestUploadSchema,
   updateMediaSchema,
 } from "./media.schema";
@@ -35,6 +43,21 @@ mediaRouter.post(
 // Public if the parent location is published; owner/admin otherwise — same
 // visibility rule as GET /v1/locations/:id (RLS-enforced).
 mediaRouter.get("/locations/:id/media", optionalAuth, validate({ params: locationIdOnlyParamSchema }), getMedia);
+
+// Phase 29 B2.5-a: atomic whole-gallery reorder. PUT because the body states the
+// gallery's complete desired order and replaces it wholesale -- sending the same
+// list twice yields the same state. There is no `PUT /media/:mediaId`, so this
+// cannot shadow another route.
+//
+// The single-row PATCH below is deliberately left in place and unchanged: the
+// current iOS build still uses it, which is exactly why B2.5-f's uniqueness
+// index is not part of this subphase.
+mediaRouter.put(
+  "/locations/:id/media/order",
+  requireAuth,
+  validate({ params: locationIdOnlyParamSchema, body: reorderMediaSchema }),
+  putMediaOrder
+);
 
 mediaRouter.patch(
   "/locations/:id/media/:mediaId",
