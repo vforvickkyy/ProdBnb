@@ -20,9 +20,17 @@ export const requestUploadSchema = z
 
 export type RequestUploadInput = z.infer<typeof requestUploadSchema>;
 
+/**
+ * Phase 29.6: `section_id` chooses the gallery this photo joins.
+ *
+ * Absent or `null` -> the location's GENERAL gallery, which is exactly what every existing caller
+ * sends and therefore exactly what they keep getting. A uuid -> that section's gallery, provided the
+ * section belongs to this location (checked in the service layer, and again in the database).
+ */
 export const completeUploadSchema = z
   .object({
     position: z.number().int().min(0).optional(),
+    section_id: z.string().uuid().nullable().optional(),
   })
   .strict();
 
@@ -48,6 +56,13 @@ export const MAX_REORDER_IDS = 100;
 export const reorderMediaSchema = z
   .object({
     ordered_ids: z.array(z.string().uuid()).min(1).max(MAX_REORDER_IDS),
+    /**
+     * Phase 29.6: which gallery is being reordered. Absent or `null` = the general gallery, so every
+     * pre-29.6 caller keeps its exact behaviour. `ordered_ids` must be the complete order of THAT
+     * gallery: naming a general photo while reordering a section (or the reverse) is rejected the
+     * same way another location's id always was.
+     */
+    section_id: z.string().uuid().nullable().optional(),
   })
   .strict()
   .refine((data) => new Set(data.ordered_ids).size === data.ordered_ids.length, {

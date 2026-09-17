@@ -214,7 +214,16 @@ export async function assertLocationManageable(
 }
 
 export async function getLocation(supabase: SupabaseClient, id: string): Promise<LocationDetail> {
-  const { data, error } = await supabase.from("locations").select(LOCATION_DETAIL_SELECT).eq("id", id).single();
+  // Phase 29.6: `media` on a location detail is the GENERAL gallery only. The embedded filter is
+  // what keeps a section's photos out of it -- without it every section photo would be flattened
+  // into `media`, and `flattenDetail`'s position sort would happily put a section photo at the
+  // front as the location's cover. Section galleries are fetched per section.
+  const { data, error } = await supabase
+    .from("locations")
+    .select(LOCATION_DETAIL_SELECT)
+    .eq("id", id)
+    .is("location_media.section_id", null)
+    .single();
 
   if (error || !data) {
     throw new NotFoundError("Location not found.");

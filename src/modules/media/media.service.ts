@@ -11,6 +11,7 @@ import {
   RawLocationMediaRow,
   toPublicMediaItem,
 } from "../locations/locations.service";
+import { assertSectionBelongsToLocation } from "../sections/sections.service";
 import { ALLOWED_CONTENT_TYPES, MediaType } from "./media.schema";
 
 const MEDIA_COLUMNS = "id, media_type, storage_key, position, metadata, created_at, updated_at";
@@ -163,11 +164,21 @@ export async function completeUpload(
   isAdmin: boolean,
   locationId: string,
   mediaId: string,
-  position: number | undefined
+  position: number | undefined,
+  sectionId: string | null = null
 ): Promise<CompleteUploadResult> {
   // Unchanged, and deliberately still first: a caller who cannot manage this location learns
   // nothing about any media id, because they never get past here.
   await assertCanManageLocation(supabase, callerId, isAdmin, locationId);
+
+  // Phase 29.6: the section must belong to THIS location. Checked before anything is recorded, so
+  // media for location A can never be attached to a section of location B. The lookup is scoped by
+  // location_id, so a section belonging to someone else is indistinguishable from one that does not
+  // exist -- the same non-oracular shape as the cross-location media id below. `record_location_media`
+  // re-checks it in the database, so even a caller bypassing this service cannot cross the boundary.
+  if (sectionId) {
+    await assertSectionBelongsToLocation(supabase, locationId, sectionId);
+  }
 
   const alreadyRecorded = await findRecordedMedia(mediaId);
   if (alreadyRecorded) {
@@ -209,6 +220,7 @@ export async function completeUpload(
     _media_type: mediaType,
     _storage_key: key,
     _position: position ?? null,
+    _section_id: sectionId,
   });
 
   const [insertedRow] = (data ?? []) as RawLocationMediaRow[];
@@ -237,6 +249,14 @@ export async function completeUpload(
   throw error ?? new Error("Failed to record uploaded media.");
 }
 
+/**
+ * The location's **general** gallery — `section_id IS NULL` — position-ordered.
+ *
+ * Phase 29.6 made that filter explicit rather than implicit. Without it this endpoint would return
+ * every section's photos mixed into the general gallery, and the first row (position 0 of whichever
+ * gallery sorted first) could be served as the location's cover. Section galleries are read from
+ * `GET /v1/locations/:id/sections/:sectionId/media`.
+ */
 export async function listMedia(supabase: SupabaseClient, locationId: string): Promise<PublicMediaItem[]> {
   const location = await getVisibleLocationOrNull(supabase, locationId);
   if (!location) {
@@ -247,6 +267,7 @@ export async function listMedia(supabase: SupabaseClient, locationId: string): P
     .from("location_media")
     .select(MEDIA_COLUMNS)
     .eq("location_id", locationId)
+    .is("section_id", null)
     .order("position", { ascending: true });
 
   if (error) {
@@ -290,7 +311,8 @@ export async function reorderMedia(
   callerId: string,
   isAdmin: boolean,
   locationId: string,
-  orderedIds: string[]
+  orderedIds: string[],
+  sectionId: string | null = null
 ): Promise<PublicMediaItem[]> {
   await assertCanManageLocation(supabase, callerId, isAdmin, locationId);
 
@@ -300,9 +322,17 @@ export async function reorderMedia(
     throw new ValidationError("ordered_ids must not contain duplicate ids.");
   }
 
-  // B2.6: the general gallery becomes `.is("section_id", null)` here, and a
-  // section's gallery `.eq("section_id", sectionId)`.
-  const { data, error } = await supabase.from("location_media").select("id").eq("location_id", locationId);
+  // Phase 29.6: the gallery being reordered. `section_id IS NULL` is the general gallery; a uuid is
+  // that section's. This is what makes a cross-gallery id fail the membership check below rather
+  // than silently renumbering the wrong gallery.
+  if (sectionId) {
+    await assertSectionBelongsToLocation(supabase, locationId, sectionId);
+  }
+
+  const galleryQuery = supabase.from("location_media").select("id").eq("location_id", locationId);
+  const { data, error } = await (sectionId
+    ? galleryQuery.eq("section_id", sectionId)
+    : galleryQuery.is("section_id", null));
 
   if (error) {
     throw error;
@@ -313,7 +343,7 @@ export async function reorderMedia(
   // Deliberately says nothing about whether an unknown id exists elsewhere —
   // validation must not become an existence oracle for another host's media.
   if (orderedIds.some((id) => !gallery.has(id))) {
-    throw new ValidationError("ordered_ids contains media that does not belong to this location's gallery.");
+    throw new ValidationError("ordered_ids contains media that does not belong to this gallery.");
   }
 
   // Completeness (approved decision Q1). Reached only when every id was
@@ -329,6 +359,7 @@ export async function reorderMedia(
   const { data: rows, error: rpcError } = await supabase.rpc("reorder_location_media", {
     _location_id: locationId,
     _ordered_ids: orderedIds,
+    _section_id: sectionId,
   });
 
   if (rpcError) {

@@ -294,7 +294,8 @@ derived from a client-supplied filename.
    client already has becomes the row's real id).
 
    Since **Phase 29.5** that insert goes through `public.record_location_media()`, which resolves
-   the new row's `position` and inserts it under a per-location transaction-scoped advisory lock.
+   the new row's `position` and inserts it under a per-gallery transaction-scoped advisory lock
+   (per-*location* until Phase 29.6 introduced sections).
    Previously the position came from a separate `select max(position)` in its own transaction, so
    two completions racing for the same location both read the same maximum and both wrote the same
    position. Harmless while positions may repeat — but iOS uploads two photos at a time, so it was
@@ -1333,6 +1334,56 @@ takes the column default, `'draft'`) — the same column exclusion now makes tha
 raw PostgREST insert, not just the app's own schema. Before this, a host could self-publish a
 draft directly via PostgREST, bypassing admin moderation entirely, or self-clear
 `moderation_reason`/restore a location an admin had suspended.
+
+### Location Sections (Phase 29.6)
+
+**`location_sections`** — an optional named production area within a location: `id`, `location_id`
+(FK → `locations`, `ON DELETE CASCADE`), `name`, `description`, `created_at`, `updated_at`. No
+`cover_id`, no `is_cover`, no slug, price, capacity or taxonomy: a section is a name, a description
+and a gallery.
+
+There is deliberately **no unique constraint on `(location_id, name)`** — duplicate section names
+are allowed. The 20-sections-per-location cap lives in the service layer, where it returns a clean
+`400` naming the limit, rather than as a trigger.
+
+**`location_media.section_id`** (nullable, FK → `location_sections`) is what joins a photo to a
+section:
+
+```
+section_id IS NULL      ->  the location's GENERAL gallery
+section_id = <section>  ->  that section's gallery
+```
+
+A photo is in exactly one gallery. Positions run `0..n-1` **within each gallery independently**, so
+a general photo and a section photo can both be at position `0`.
+
+> **Every query that means "the general gallery" must say `section_id is null` explicitly.** A
+> cover-photo lookup is `order by position limit 1`, and a section photo at position 0 will win it
+> otherwise. Phase 29.6 added that predicate to `search_locations()`'s `primary_media_key`, to
+> `get_conversations_for_viewer()`'s `location_primary_media_key`, to `listMedia()` and to the
+> embedded `location_media` on `GET /v1/locations/:id`. Both RPCs use
+> `section_id is not distinct from _section_id`, which selects the general gallery on NULL —
+> `section_id = null` would match no rows and quietly hand every general upload position 0.
+
+Two partial indexes back those two access patterns:
+`location_media_general_gallery_idx (location_id, position) where section_id is null` and
+`location_media_section_position_idx (section_id, position) where section_id is not null`.
+
+**`section_id` is `ON DELETE NO ACTION`, deliberately.** CASCADE would delete a section's photos —
+and media deletion is the only path that also removes the R2 object, so it would silently orphan
+storage. RESTRICT would be worse than it looks: deleting a *location* cascades to `location_sections`
+and `location_media` independently, in an undefined order, and an immediate RESTRICT check would
+abort a location delete that works today. NO ACTION is checked at the end of the statement, by which
+time both cascades have resolved — so deleting a location with sections and section media works,
+while deleting a section that still holds media raises `23503`. The API refuses the latter with a
+`409` long before the constraint is reached.
+
+**Grants and RLS** mirror `location_media`. Supabase's `ALTER DEFAULT PRIVILEGES` grants ALL on new
+public tables to `anon`/`authenticated`, so the migration revokes first and grants back explicitly
+(the Phase 12 pattern): `select` to `anon`, full DML to `authenticated`, gated by two policies —
+`location_sections_select_via_location` (mirrors the parent location's visibility) and
+`location_sections_write_via_location_owner` (owner or admin, with `WITH CHECK` so a section cannot
+be moved to another location).
 
 **`location_media`** — `authenticated` loses `INSERT` entirely (kept: `UPDATE (position)` for
 reordering, and `DELETE`, both already ownership-gated and unaffected). Only

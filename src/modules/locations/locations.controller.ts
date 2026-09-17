@@ -16,11 +16,17 @@ import {
   listMyLocations,
   updateLocation,
 } from "./locations.service";
+import { sectionSummariesFor } from "../sections/sections.service";
 
 export async function getLocationDetail(req: Request, res: Response): Promise<void> {
   const { id } = req.valid!.params as LocationIdParam;
   const location = await getLocation(req.supabase!, id);
-  ok(res, location);
+  // Phase 29.6: lightweight section metadata — id/name/description/cover/photo_count — so a client
+  // can render a section rail from this one response. Deliberately NOT every photo of every
+  // section: that would make a 20-section location's detail hundreds of media rows. The full
+  // gallery is one request away at GET /v1/locations/:id/sections/:sectionId/media.
+  const sections = await sectionSummariesFor(req.supabase!, id);
+  ok(res, { ...location, sections });
 }
 
 export async function postLocation(req: Request, res: Response): Promise<void> {

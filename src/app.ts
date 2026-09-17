@@ -18,6 +18,7 @@ import { postCashfreeWebhook } from "./modules/payments/payment.controller";
 import { paymentsRouter } from "./modules/payments/payment.routes";
 import { pricingRouter } from "./modules/pricing/pricing.routes";
 import { rolesRouter } from "./modules/roles/roles.routes";
+import { sectionsRouter } from "./modules/sections/sections.routes";
 import { usersRouter } from "./modules/users/users.routes";
 
 /** Never resolves later than `ms` — bounds the readiness check below so a
@@ -104,6 +105,7 @@ export function createApp(): Express {
   app.use("/v1", rolesRouter);
   app.use("/v1", locationsRouter);
   app.use("/v1", mediaRouter);
+  app.use("/v1", sectionsRouter);
   app.use("/v1", availabilityRouter);
   app.use("/v1", bookingsRouter);
   app.use("/v1", pricingRouter);

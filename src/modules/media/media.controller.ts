@@ -31,9 +31,9 @@ export async function postRequestUpload(req: Request, res: Response): Promise<vo
  */
 export async function postCompleteUpload(req: Request, res: Response): Promise<void> {
   const { id, mediaId } = req.valid!.params as LocationMediaParams;
-  const { position } = req.valid!.body as CompleteUploadInput;
+  const { position, section_id } = req.valid!.body as CompleteUploadInput;
   const isAdmin = await isCallerAdmin(req);
-  const result = await completeUpload(req.supabase!, req.user!.id, isAdmin, id, mediaId, position);
+  const result = await completeUpload(req.supabase!, req.user!.id, isAdmin, id, mediaId, position, section_id ?? null);
   if (result.created) {
     created(res, result.item);
     return;
@@ -50,9 +50,9 @@ export async function getMedia(req: Request, res: Response): Promise<void> {
 /** Phase 29 B2.5-a. Returns the resulting order, 200, in the module's existing `{ data }` envelope. */
 export async function putMediaOrder(req: Request, res: Response): Promise<void> {
   const { id } = req.valid!.params as LocationIdOnlyParam;
-  const { ordered_ids } = req.valid!.body as ReorderMediaInput;
+  const { ordered_ids, section_id } = req.valid!.body as ReorderMediaInput;
   const isAdmin = await isCallerAdmin(req);
-  const media = await reorderMedia(req.supabase!, req.user!.id, isAdmin, id, ordered_ids);
+  const media = await reorderMedia(req.supabase!, req.user!.id, isAdmin, id, ordered_ids, section_id ?? null);
   ok(res, media);
 }
 

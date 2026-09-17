@@ -434,7 +434,12 @@ Requires authentication (owner or admin). Call this after the `PUT` above succee
 verifies directly with R2 that the object exists (never trusts the client's word for it) before
 recording it.
 
-Request: `{ "position": 0 }` (optional — defaults to appended-at-the-end)
+Request: `{ "position": 0, "section_id": "s1e2..." }` — both optional.
+
+`section_id` chooses the gallery this photo joins: omitted or `null` puts it in the location's
+general gallery (the pre-Phase-29.6 behaviour, unchanged), a section uuid puts it in that section.
+The section must belong to this location; one that does not returns `404`, with the same body as a
+section that does not exist. `position` defaults to appended-at-the-end **of that gallery**.
 
 Response (`201`) on the call that records the row; **`200`** for an idempotent replay of a media id
 already recorded against this location, returning that row exactly as first stored (no second R2
@@ -452,13 +457,23 @@ a per-location lock, so two uploads completing at the same moment cannot be give
 ### `GET /v1/locations/:id/media`
 
 Optional authentication — same visibility as `GET /v1/locations/:id` (published is public,
-otherwise owner/admin only). Returns the location's media, ordered by `position`.
+otherwise owner/admin only). Returns the location's **general gallery** — the media whose
+`section_id` is `NULL` — ordered by `position`.
+
+Since Phase 29.6 a location's photos may be split between the general gallery and named sections.
+This endpoint returns the general gallery **only**; a section's photos come from
+`GET /v1/locations/:id/sections/:sectionId/media`.
 
 ### `PUT /v1/locations/:id/media/order`
 
 Requires authentication (owner or admin). **The supported way to reorder a gallery.**
 
-Request: `{ "ordered_ids": ["a1b2...", "c3d4...", "e5f6..."] }`
+Request: `{ "ordered_ids": ["a1b2...", "c3d4...", "e5f6..."], "section_id": "s1e2..." }`
+
+`section_id` selects which gallery is being reordered: omitted or `null` is the general gallery
+(unchanged from before Phase 29.6), a uuid is that section's. `ordered_ids` must be the complete
+order of **that** gallery — naming a general-gallery photo while reordering a section, or a photo
+from a different section, is rejected exactly as another location's id always was.
 
 `ordered_ids` must be the gallery's **complete** order — every photo in it, exactly once. The
 backend owns the renumbering: it renumbers to exactly `0..n-1` in the order given, in one
@@ -484,6 +499,104 @@ Response (`200`): the location's media in the new order, with positions `0..n-1`
 Requires authentication (owner or admin). Deletes the R2 object and the metadata row.
 
 Response (`200`): `{ "data": { "id": "a1b2...", "deleted": true } }`
+
+## Location Sections (Phase 29.6)
+
+A location may optionally be divided into named production areas — "Police Station", "Arabian
+City", "Warehouse". Each section has a name, an optional description, and its own ordered photos.
+
+**The one rule everything follows from:**
+
+```
+location_media.section_id IS NULL      ->  the location's GENERAL gallery
+location_media.section_id = <section>  ->  that section's gallery
+```
+
+A photo belongs to exactly **one** gallery. There is no many-to-many membership, no duplicated row
+to make a photo appear twice, and no `is_cover` flag. The cover convention is unchanged and applies
+*within* a gallery: the lowest `position` among that gallery's rows. Positions are numbered `0..n-1`
+independently per gallery, so a general photo and a section photo may both sit at position `0`.
+
+Sections are optional. A location with none behaves exactly as it did before Phase 29.6, and every
+photo that existed before this phase is a general-gallery photo.
+
+Ownership follows the rest of the API: the location's host or an admin may manage its sections, and
+reads mirror `GET /v1/locations/:id` — a published location's sections are public, a draft's are
+visible only to its owner and to admins. A section id belonging to another location is rejected with
+the same `404` as one that does not exist.
+
+A location may have at most **20** sections. Duplicate section names within a location are
+**allowed** — two stages really can both be called "Warehouse".
+
+### `GET /v1/locations/:id/sections`
+
+Optional authentication. Lightweight metadata for every section, oldest first:
+
+```json
+{
+  "data": [
+    {
+      "id": "s1e2...",
+      "location_id": "6e2c...",
+      "name": "Police Station",
+      "description": "Two-storey exterior with working cells",
+      "cover": { "id": "a1b2...", "media_type": "photo", "url": "https://...", "position": 0, "created_at": "...", "updated_at": "..." },
+      "photo_count": 12,
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ]
+}
+```
+
+`cover` is the section's own lowest-positioned photo, or `null` when it has none. Deliberately **not**
+every photo of every section: a client rendering a section rail needs one image and a count, and the
+full gallery is one request away.
+
+The same array is embedded in `GET /v1/locations/:id` as `sections`, so a location detail can render
+a section rail without a second request.
+
+### `GET /v1/locations/:id/sections/:sectionId`
+
+Optional authentication. The section's metadata (no `cover`/`photo_count`).
+
+### `GET /v1/locations/:id/sections/:sectionId/media`
+
+Optional authentication. That section's photos, ordered by `position`. Returns nothing from the
+general gallery and nothing from any other section.
+
+### `POST /v1/locations/:id/sections`
+
+Requires authentication (owner or admin).
+
+Request: `{ "name": "Arabian City", "description": "Desert street set" }` — `name` is required
+(1–200 characters after trimming), `description` optional (≤ 5000 characters, nullable).
+
+Response (`201`): the created section.
+
+- `400 VALIDATION_ERROR` for a missing/blank/over-long name, an over-long description, an unknown
+  field, or when the location already has 20 sections.
+- `404` / `403` follow the usual location rules.
+
+### `PATCH /v1/locations/:id/sections/:sectionId`
+
+Requires authentication (owner or admin). Accepts `name` and/or `description`; at least one is
+required. A section **cannot be moved to another location** — `location_id` is not accepted, and the
+database policy refuses it independently.
+
+### `DELETE /v1/locations/:id/sections/:sectionId`
+
+Requires authentication (owner or admin).
+
+**The section must be empty.** A section that still holds photos returns `409 CONFLICT` naming the
+count, and nothing is deleted.
+
+Deleting a section deliberately does **not** delete its photos: media deletion is the only path that
+also removes the stored R2 object, and it must stay an explicit act. Nor are the photos silently
+moved to the general gallery — that is a decision for a person, not a side effect of a `DELETE`. To
+remove a section, delete or move its photos first.
+
+Response (`200`): `{ "data": { "id": "s1e2...", "deleted": true } }`
 
 ## Availability & Calendar (Phase 5)
 
