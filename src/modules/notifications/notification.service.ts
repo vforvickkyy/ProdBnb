@@ -433,7 +433,11 @@ export async function listNotifications(supabase: SupabaseClient, query: ListNot
   const from = (query.page - 1) * query.pageSize;
   const to = from + query.pageSize - 1;
 
-  let request = supabase.from("notifications").select(NOTIFICATION_COLUMNS, { count: "exact" });
+  // `count: "exact"` is what the iOS unread badge reads (it asks for the
+  // smallest possible unread page and uses meta.total), so the soft-delete
+  // filter below is what keeps a deleted unread notification out of the badge
+  // as well as out of the list -- one filter, both concerns.
+  let request = supabase.from("notifications").select(NOTIFICATION_COLUMNS, { count: "exact" }).is("deleted_at", null);
   if (query.unread === true) {
     request = request.is("read_at", null);
   }
@@ -447,11 +451,20 @@ export async function listNotifications(supabase: SupabaseClient, query: ListNot
 }
 
 export async function getNotification(supabase: SupabaseClient, id: string): Promise<NotificationDetail> {
-  const { data, error } = await supabase.from("notifications").select(NOTIFICATION_COLUMNS).eq("id", id).maybeSingle();
+  const { data, error } = await supabase
+    .from("notifications")
+    .select(NOTIFICATION_COLUMNS)
+    .eq("id", id)
+    .is("deleted_at", null)
+    .maybeSingle();
   if (error) {
     throw error;
   }
   if (!data) {
+    // Covers three cases that must be indistinguishable to the caller: no such
+    // row, someone else's row (RLS hid it), and the caller's own soft-deleted
+    // row. A deleted notification is gone as far as every read path is
+    // concerned.
     throw new NotFoundError("Notification not found.");
   }
   return data as NotificationDetail;
@@ -481,9 +494,68 @@ export async function markAllNotificationsRead(supabase: SupabaseClient, userId:
     .update({ read_at: new Date().toISOString() })
     .eq("user_id", userId)
     .is("read_at", null)
+    .is("deleted_at", null)
     .select("id");
   if (error) {
     throw error;
   }
   return (data ?? []).length;
+}
+
+/**
+ * Removes a notification from the caller's inbox -- a SOFT delete.
+ *
+ * Deliberately an UPDATE, not a DELETE. The full reasoning lives in the Phase
+ * 29.12 migration; the short version is that
+ * notification_delivery_attempts.notification_id is an unqualified FK (NO
+ * ACTION), so a hard delete would raise 23503 for any notification that was
+ * ever pushed, and removing the row would free the (user_id, source_event_id)
+ * idempotency key and let a retried source event resurrect what the user
+ * deleted.
+ *
+ * Authorisation is RLS's, not this function's: `notifications_update_own`
+ * restricts the UPDATE to `user_id = auth.uid()`, so another user's
+ * notification matches no row here and falls through to the NotFoundError
+ * below -- the same answer a nonexistent id gets, which is what stops this
+ * endpoint from being an existence oracle.
+ *
+ * Idempotent: deleting an already-deleted notification succeeds and reports
+ * the existing `deleted_at` rather than throwing or re-stamping it.
+ */
+export async function deleteNotification(supabase: SupabaseClient, id: string): Promise<void> {
+  // Read first so an already-deleted row is a success rather than a 404. Note
+  // this cannot use getNotification(): that one filters `deleted_at is null`
+  // by design, which is exactly the row we need to see here.
+  const { data: existing, error: readError } = await supabase
+    .from("notifications")
+    .select("id, deleted_at")
+    .eq("id", id)
+    .maybeSingle();
+  if (readError) {
+    throw readError;
+  }
+  if (!existing) {
+    throw new NotFoundError("Notification not found.");
+  }
+  if (existing.deleted_at) {
+    return; // idempotent -- already removed from the inbox
+  }
+
+  const { data, error } = await supabase
+    .from("notifications")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", id)
+    .is("deleted_at", null)
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    throw error;
+  }
+  if (!data) {
+    // The row was visible a moment ago but the UPDATE matched nothing: either
+    // a concurrent delete won the race (fine, the end state is what was asked
+    // for) or the WITH CHECK refused it. Treating it as success is correct for
+    // the first and harmless for the second, since nothing was mutated.
+    return;
+  }
 }

@@ -428,4 +428,293 @@ describe("notifications", () => {
       await deleteTestUser(freshUser.id);
     });
   });
+
+  // =========================================================================
+  // Phase 29.12 -- soft delete.
+  //
+  // The rule under test throughout: DELETE /v1/notifications/:id removes the
+  // notification from every user-facing read path while the ROW survives, so
+  // that (a) the append-only delivery audit keeps its FK target and (b) the
+  // (user_id, source_event_id) idempotency key keeps colliding, which is what
+  // stops a retried source event from resurrecting a deleted notification.
+  // =========================================================================
+  describe("soft delete", () => {
+    /** A fresh host with exactly one notification of their own, plus its id. */
+    async function userWithOneNotification(): Promise<{ user: TestUser; notificationId: string }> {
+      const user = await createTestUser();
+      await grantRole(user, "host");
+      const locationId = await createBookableLocation(user);
+      const booking = await createBooking(booker, locationId);
+      const list = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+      const target = list.body.data.find((n: { entity_id: string }) => n.entity_id === booking.id);
+      expect(target).toBeDefined();
+      return { user, notificationId: target.id as string };
+    }
+
+    it("soft-deletes the caller's own notification and hides it from the list", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+
+      const del = await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+      expect(del.status).toBe(200);
+
+      const after = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+      expect(after.body.data.some((n: { id: string }) => n.id === notificationId)).toBe(false);
+
+      await deleteTestUser(user.id);
+    });
+
+    it("the row survives -- deletion is an UPDATE, never a DELETE", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+      await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+
+      const { data, error } = await adminClient
+        .from("notifications")
+        .select("id, deleted_at, read_at, source_event_id")
+        .eq("id", notificationId)
+        .single();
+      if (error) throw error;
+      expect(data.id).toBe(notificationId);
+      expect(data.deleted_at).not.toBeNull();
+      expect(data.source_event_id).not.toBeNull(); // idempotency key retained
+
+      await deleteTestUser(user.id);
+    });
+
+    it("a deleted notification is excluded from the unread query AND the unread count", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+
+      // meta.total on the unread filter is exactly what the iOS bell badge reads.
+      const before = await request(app)
+        .get("/v1/notifications")
+        .set(authHeader(user))
+        .query({ unread: "true", pageSize: 1 });
+      expect(before.body.meta.total).toBeGreaterThanOrEqual(1);
+
+      await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+
+      const afterList = await request(app)
+        .get("/v1/notifications")
+        .set(authHeader(user))
+        .query({ unread: "true", pageSize: 100 });
+      expect(afterList.body.data.some((n: { id: string }) => n.id === notificationId)).toBe(false);
+
+      const afterCount = await request(app)
+        .get("/v1/notifications")
+        .set(authHeader(user))
+        .query({ unread: "true", pageSize: 1 });
+      expect(afterCount.body.meta.total).toBe(before.body.meta.total - 1);
+
+      await deleteTestUser(user.id);
+    });
+
+    it("a deleted notification is excluded from the detail endpoint", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+
+      const before = await request(app).get(`/v1/notifications/${notificationId}`).set(authHeader(user));
+      expect(before.status).toBe(200);
+
+      await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+
+      const after = await request(app).get(`/v1/notifications/${notificationId}`).set(authHeader(user));
+      expect(after.status).toBe(404);
+
+      await deleteTestUser(user.id);
+    });
+
+    it("mark-read on a deleted notification is a 404, not a resurrection", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+      await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+
+      const read = await request(app).post(`/v1/notifications/${notificationId}/read`).set(authHeader(user));
+      expect(read.status).toBe(404);
+
+      const list = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+      expect(list.body.data.some((n: { id: string }) => n.id === notificationId)).toBe(false);
+
+      await deleteTestUser(user.id);
+    });
+
+    it("read-all ignores deleted notifications and never brings them back", async () => {
+      const user = await createTestUser();
+      await grantRole(user, "host");
+      const locationId = await createBookableLocation(user);
+      await createBooking(booker, locationId);
+      await createBooking(booker, locationId);
+
+      const before = await request(app).get("/v1/notifications").set(authHeader(user)).query({ unread: "true", pageSize: 100 });
+      const unreadBefore = before.body.data.length;
+      expect(unreadBefore).toBeGreaterThanOrEqual(2);
+      const doomed = before.body.data[0].id as string;
+
+      await request(app).delete(`/v1/notifications/${doomed}`).set(authHeader(user));
+
+      const readAll = await request(app).post("/v1/notifications/read-all").set(authHeader(user));
+      expect(readAll.status).toBe(200);
+      // The deleted one is NOT counted -- it was excluded from the update.
+      expect(readAll.body.data.marked_read).toBe(unreadBefore - 1);
+
+      const after = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+      expect(after.body.data.some((n: { id: string }) => n.id === doomed)).toBe(false);
+
+      // And the deleted row was never marked read behind the scenes.
+      const { data, error } = await adminClient.from("notifications").select("read_at").eq("id", doomed).single();
+      if (error) throw error;
+      expect(data.read_at).toBeNull();
+
+      await deleteTestUser(user.id);
+    });
+
+    it("MANDATORY REGRESSION: a notification with delivery-attempt rows can be soft-deleted, and the audit survives", async () => {
+      // This is the case a hard DELETE cannot serve:
+      // notification_delivery_attempts.notification_id references
+      // notifications(id) with NO `on delete` clause, so removing the row
+      // would raise FK violation 23503 for every notification that was ever
+      // pushed to a device.
+      const user = await createTestUser();
+      await grantRole(user, "host");
+      await request(app).post("/v1/devices").set(authHeader(user)).send({ device_token: "tok-softdelete-1", platform: "ios" });
+
+      const locationId = await createBookableLocation(user);
+      const booking = await createBooking(booker, locationId);
+
+      const { data: notif, error } = await adminClient
+        .from("notifications")
+        .select("id")
+        .eq("user_id", user.id)
+        .eq("entity_id", booking.id)
+        .eq("type", "booking_request_received")
+        .single();
+      if (error) throw error;
+
+      const { data: attemptsBefore, error: beforeError } = await adminClient
+        .from("notification_delivery_attempts")
+        .select("id")
+        .eq("notification_id", notif.id);
+      if (beforeError) throw beforeError;
+      expect(attemptsBefore!.length).toBeGreaterThanOrEqual(1); // the FK that would block a hard delete
+
+      const del = await request(app).delete(`/v1/notifications/${notif.id}`).set(authHeader(user));
+      expect(del.status).toBe(200); // no 23503, no 500
+
+      const list = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+      expect(list.body.data.some((n: { id: string }) => n.id === notif.id)).toBe(false);
+
+      const { data: attemptsAfter, error: afterError } = await adminClient
+        .from("notification_delivery_attempts")
+        .select("id")
+        .eq("notification_id", notif.id);
+      if (afterError) throw afterError;
+      expect(attemptsAfter!.length).toBe(attemptsBefore!.length); // audit intact
+
+      await deleteTestUser(user.id);
+    });
+
+    it("soft deletion does NOT free the idempotency key -- a retried source event cannot resurrect it", async () => {
+      const locationId = await createBookableLocation(host);
+      const booking = await createBooking(booker, locationId);
+
+      await notifyBookingConfirmed(booker.id, booking.id);
+      const list = await request(app).get("/v1/notifications").set(authHeader(booker)).query({ pageSize: 100 });
+      const target = list.body.data.find(
+        (n: { entity_id: string; type: string }) => n.entity_id === booking.id && n.type === "booking_confirmed"
+      );
+      expect(target).toBeDefined();
+
+      await request(app).delete(`/v1/notifications/${target.id}`).set(authHeader(booker));
+
+      // Re-fire the exact same source event. The surviving row still owns
+      // (user_id, source_event_id), so the insert collides and is dropped.
+      await notifyBookingConfirmed(booker.id, booking.id);
+
+      const after = await request(app).get("/v1/notifications").set(authHeader(booker)).query({ pageSize: 100 });
+      expect(
+        after.body.data.some((n: { entity_id: string; type: string }) => n.entity_id === booking.id && n.type === "booking_confirmed")
+      ).toBe(false);
+
+      const { data, error } = await adminClient
+        .from("notifications")
+        .select("id")
+        .eq("user_id", booker.id)
+        .eq("entity_id", booking.id)
+        .eq("type", "booking_confirmed");
+      if (error) throw error;
+      expect(data).toHaveLength(1); // still exactly one row, still deleted
+    });
+
+    it("deleting an already-deleted notification is idempotent, not an error", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+
+      const first = await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+      expect(first.status).toBe(200);
+
+      const { data: afterFirst } = await adminClient
+        .from("notifications")
+        .select("deleted_at")
+        .eq("id", notificationId)
+        .single();
+
+      const second = await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+      expect(second.status).toBe(200); // not 404, not 500
+
+      const { data: afterSecond } = await adminClient
+        .from("notifications")
+        .select("deleted_at")
+        .eq("id", notificationId)
+        .single();
+      expect(afterSecond!.deleted_at).toBe(afterFirst!.deleted_at); // not re-stamped
+
+      await deleteTestUser(user.id);
+    });
+
+    it("a user cannot delete another user's notification", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+
+      const cross = await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(otherBooker));
+      expect(cross.status).toBe(404); // indistinguishable from "no such id" -- not an existence oracle
+
+      // And it is genuinely untouched.
+      const { data, error } = await adminClient.from("notifications").select("deleted_at").eq("id", notificationId).single();
+      if (error) throw error;
+      expect(data.deleted_at).toBeNull();
+
+      const stillThere = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+      expect(stillThere.body.data.some((n: { id: string }) => n.id === notificationId)).toBe(true);
+
+      await deleteTestUser(user.id);
+    });
+
+    it("rejects unauthenticated deletion", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+
+      const res = await request(app).delete(`/v1/notifications/${notificationId}`);
+      expect(res.status).toBe(401);
+
+      const { data, error } = await adminClient.from("notifications").select("deleted_at").eq("id", notificationId).single();
+      if (error) throw error;
+      expect(data.deleted_at).toBeNull();
+
+      await deleteTestUser(user.id);
+    });
+
+    it("rejects a malformed notification id", async () => {
+      const res = await request(app).delete("/v1/notifications/not-a-uuid").set(authHeader(booker));
+      expect(res.status).toBe(400);
+    });
+
+    it("repeated list/refresh never resurrects a deleted notification", async () => {
+      const { user, notificationId } = await userWithOneNotification();
+      await request(app).delete(`/v1/notifications/${notificationId}`).set(authHeader(user));
+
+      // The iOS client re-reads the whole page on pull-to-refresh and on every
+      // foreground push arrival -- the exact path that would expose a fake,
+      // in-memory-only delete.
+      for (let i = 0; i < 3; i += 1) {
+        const res = await request(app).get("/v1/notifications").set(authHeader(user)).query({ pageSize: 100 });
+        expect(res.status).toBe(200);
+        expect(res.body.data.some((n: { id: string }) => n.id === notificationId)).toBe(false);
+      }
+
+      await deleteTestUser(user.id);
+    });
+  });
 });
